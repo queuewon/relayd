@@ -1,0 +1,32 @@
+use std::{io, num::ParseIntError, str::Utf8Error};
+
+#[derive(Debug)]
+pub enum ConnectionError {
+    Io(io::Error),            // read 자체가 실패한 경우, 소켓이 죽음
+    ClientClosed,             // 파싱 완료 전 EOF
+    MalformedRequest(String), // 파싱 실패 — 400 대상
+    AllBackendsUnreachable,   // 연결 실패 - 모든 백엔드 순회 후 실패
+    NoBackendAvailable,       // 백엔드 목록 없음
+}
+impl From<io::Error> for ConnectionError {
+    fn from(e: io::Error) -> Self {
+        ConnectionError::Io(e)
+    }
+}
+impl From<std::num::ParseIntError> for ConnectionError {
+    fn from(e: ParseIntError) -> Self {
+        ConnectionError::MalformedRequest(e.to_string())
+    }
+}
+impl From<std::str::Utf8Error> for ConnectionError {
+    fn from(e: Utf8Error) -> Self {
+        ConnectionError::MalformedRequest(e.to_string())
+    }
+}
+
+#[derive(Eq, PartialEq)]
+pub enum BodyKind {
+    None,                 // Content-Length도 chunked도 없음 — 바디 없음
+    ContentLength(usize), // 정해진 길이만큼 읽기
+    Chunked,              // 청크 단위로 읽기 (아직은 미구현)
+}
