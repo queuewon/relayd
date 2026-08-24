@@ -5,7 +5,6 @@ use tokio::{io, net::TcpListener};
 use crate::{
     balancer::{
         Balancer,
-        round_robin::RoundRobinBalancer,
         weight_round_robin::{Backend, WeightRoundRobinBalancer},
     },
     pool::connection_pool::ConnectionPool,
