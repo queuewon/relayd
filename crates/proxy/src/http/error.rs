@@ -1,12 +1,21 @@
 use std::{io, num::ParseIntError, str::Utf8Error};
 
 #[derive(Debug)]
+pub enum PoolError {
+    AcquireTimeout, // 풀에서 permit을 timeout 안에 못 얻음ㄴ
+}
+
+#[derive(Debug)]
 pub enum ConnectionError {
     Io(io::Error),            // read 자체가 실패한 경우, 소켓이 죽음
     ClientClosed,             // 파싱 완료 전 EOF
     MalformedRequest(String), // 파싱 실패 — 400 대상
     AllBackendsUnreachable,   // 연결 실패 - 모든 백엔드 순회 후 실패
     NoBackendAvailable,       // 백엔드 목록 없음
+    PoolAcquireTimeout,       // 풀에서 permit을 timeout 안에 못 얻음
+
+    MalformedResponse(String),
+    BackendClose,
 }
 impl From<io::Error> for ConnectionError {
     fn from(e: io::Error) -> Self {
@@ -21,6 +30,13 @@ impl From<std::num::ParseIntError> for ConnectionError {
 impl From<std::str::Utf8Error> for ConnectionError {
     fn from(e: Utf8Error) -> Self {
         ConnectionError::MalformedRequest(e.to_string())
+    }
+}
+impl From<PoolError> for ConnectionError {
+    fn from(e: PoolError) -> Self {
+        match e {
+            PoolError::AcquireTimeout => ConnectionError::PoolAcquireTimeout,
+        }
     }
 }
 

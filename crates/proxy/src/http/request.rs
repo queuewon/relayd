@@ -2,8 +2,8 @@ use tokio::{io::AsyncReadExt, net::TcpStream};
 
 use crate::http::{
     error::{BodyKind, ConnectionError},
-    request,
-    types::{HeaderParseResult, ParsedRequest},
+    types::{ParsedRequest, RequestHeaderParseResult},
+    version_to_string,
 };
 
 pub async fn parse_client_header(
@@ -31,18 +31,18 @@ pub async fn parse_client_header(
         let mut req = httparse::Request::new(&mut headers);
 
         // 헤더 파싱
-        let client_buf_parsing_status = match req.parse(buf) {
+        let parsing_status = match req.parse(buf) {
             Ok(s) => s,
             Err(e) => return Err(ConnectionError::MalformedRequest(e.to_string())),
         };
 
-        match client_buf_parsing_status {
+        match parsing_status {
             httparse::Status::Complete(s) => {
                 parsed_req.header.method = req.method.unwrap_or_default().to_string();
                 parsed_req.header.path = req.path.unwrap_or_default().to_string();
 
                 let received_version = req.version.unwrap_or_default();
-                let version = request::version_to_string(received_version);
+                let version = version_to_string(received_version);
 
                 parsed_req.header.version = version;
                 parsed_req.header.headers = req
@@ -60,7 +60,7 @@ pub async fn parse_client_header(
     }
 }
 
-pub fn serialize_headers(req: &HeaderParseResult) -> Vec<u8> {
+pub fn serialize_headers(req: &RequestHeaderParseResult) -> Vec<u8> {
     let mut ser_req: Vec<u8> = Vec::new();
     ser_req.extend_from_slice(
         format!("{} {} HTTP/{}\r\n", req.method, req.path, req.version).as_bytes(),
@@ -105,14 +105,4 @@ pub async fn read_body(
     }
 
     Ok(BodyKind::ContentLength(content_length))
-}
-
-pub fn version_to_string(version: u8) -> String {
-    match version {
-        0 => return "1.0".to_string(),
-        1 => return "1.1".to_string(),
-        2 => return "2".to_string(),
-        3 => return "3".to_string(),
-        _ => return "1.1".to_string(),
-    }
 }
