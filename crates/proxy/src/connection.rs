@@ -6,7 +6,7 @@ use tokio::{
 };
 
 use crate::{
-    balancer::{BalancerError, round_robin::RoundRobinBalancer},
+    balancer::{Balancer, BalancerError},
     http::{
         error::{
             BodyKind,
@@ -22,7 +22,7 @@ use crate::{
 pub async fn handle_connection(
     mut client_stream: TcpStream,
     client_addr: SocketAddr,
-    balancer: &Arc<RoundRobinBalancer>,
+    balancer: &Arc<Balancer>,
     conn_pool: &Arc<ConnectionPool>,
 ) -> Result<(), ConnectionError> {
     let mut client_buf: Vec<u8> = Vec::new();
@@ -195,7 +195,7 @@ pub async fn handle_connection(
 }
 
 pub async fn connect_with_retry(
-    balancer: &Arc<RoundRobinBalancer>,
+    balancer: &Arc<Balancer>,
     conn_pool: &Arc<ConnectionPool>,
 ) -> Result<PooledConnection, ConnectionError> {
     if balancer.backend_count() == 0 {
@@ -226,6 +226,7 @@ pub async fn connect_with_retry(
                 };
 
                 let timeout = Duration::new(5, 0);
+                // TODO: 다른 백엔드로의 재시도
                 let permit = match conn_pool.acquire_permit(timeout).await {
                     Ok(p) => p,
                     Err(e) => {
