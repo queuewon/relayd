@@ -1,12 +1,17 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, web};
-use std::env;
+use std::{env, time::Duration};
 
 struct Config {
     name: String,
+    delay_ms: usize,
 }
 
 #[get("/")]
-async fn root(cfg: web::Data<Config>, req: HttpRequest) -> impl Responder {
+async fn root(cfg: web::Data<Config>, _req: HttpRequest) -> impl Responder {
+    if cfg.delay_ms > 0 {
+        let duration = Duration::from_millis(cfg.delay_ms as u64);
+        tokio::time::sleep(duration).await;
+    }
     HttpResponse::Ok().body(format!("hello from {}", cfg.name))
 }
 
@@ -31,12 +36,16 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let name = args.get(1).cloned().unwrap_or_else(|| "A".into());
     let port: u16 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(8081);
+    let delay_ms = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(0);
 
     println!("backend {} listening on {}", name, port);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(Config { name: name.clone() }))
+            .app_data(web::Data::new(Config {
+                name: name.clone(),
+                delay_ms,
+            }))
             .service(root)
             .service(healthz)
             .service(slow)
