@@ -11,14 +11,35 @@ export const options = {
   summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)"],
 };
 
+// 1. Weight Round Robin
+// export default function () {
+//   const res = http.get("http://localhost:8080/");
+//   check(res, { "status is 200": (r) => r.status === 200 });
+
+//   if ((res.body as string).includes("A")) {
+//     backendACounter.add(1);
+//   } else if ((res.body as string).includes("B")) {
+//     backendBCounter.add(1);
+//   }
+
+//   sleep(0.1);
+// }
+
+// 2. Least Connections
+const failedCounter = new Counter("failed_count");
+
 export default function () {
   const res = http.get("http://localhost:8080/");
-  check(res, { "status is 200": (r) => r.status === 200 });
+  const ok = check(res, { "status is 200": (r) => r.status === 200 });
 
-  if ((res.body as string).includes("A")) {
-    backendACounter.add(1);
-  } else if ((res.body as string).includes("B")) {
-    backendBCounter.add(1);
+  if (ok && res.body) {
+    if ((res.body as string).includes("A")) {
+      backendACounter.add(1);
+    } else if ((res.body as string).includes("B")) {
+      backendBCounter.add(1);
+    }
+  } else {
+    failedCounter.add(1);
   }
 
   sleep(0.1);
