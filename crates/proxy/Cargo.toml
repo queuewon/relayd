@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 httparse = "1.10.1"
+toml = "1.1.4"
+serde = { version = "1.0.229", features = ["derive"] }

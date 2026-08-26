@@ -1,52 +1,24 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio::{io, net::TcpListener};
 
-use crate::{
-    balancer::{
-        Balancer,
-        least_connections::{Backend as LeastConnectionsBackend, LeastConnectionsBalancer},
-        weight_round_robin::{Backend as WeightRoundRobinBackend, WeightRoundRobinBalancer},
-    },
-    pool::connection_pool::ConnectionPool,
-};
+use crate::{balancer::Balancer, config::ProxyConfig, pool::connection_pool::ConnectionPool};
 
 pub mod balancer;
+pub mod config;
 pub mod connection;
 pub mod http;
 pub mod pool;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // bind()를 loop 안에 넣으면 loop 돌 때마다 같은 포트(8080)에 또 서버를 열려고 시도하는 꼴
+    let content =
+        std::fs::read_to_string("crates/proxy/config.toml").expect("프록시 설정파일 불러오기 실패");
+    let config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
+
+    let balancer = Balancer::from_config(config);
+
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
-
-    let addr1 = "127.0.0.1:8081"
-        .parse::<SocketAddr>()
-        .map_err(io::Error::other)?;
-    let addr2 = "127.0.0.1:8082"
-        .parse::<SocketAddr>()
-        .map_err(io::Error::other)?;
-
-    // 1. RoundRobin
-    // let backends = vec![addr1, addr2];
-    // let balancer = Balancer::RoundRobin(RoundRobinBalancer::new(backends));
-
-    // 2. WeightRoundRobin
-    // let backend1 = WeightRoundRobinBackend::new(addr1, 3);
-    // let backend2 = WeightRoundRobinBackend::new(addr2, 1);
-    // let backends = vec![backend1, backend2];
-
-    // let balancer = Balancer::Weighted(WeightRoundRobinBalancer::new(backends));
-
-    // 3. LeastConnections
-
-    let backend1 = LeastConnectionsBackend::new(addr1);
-    let backend2 = LeastConnectionsBackend::new(addr2);
-
-    let backends = vec![backend1, backend2];
-
-    let balancer = Balancer::LeastConnections(LeastConnectionsBalancer::new(backends));
 
     let arc_balancer = Arc::new(balancer);
 
