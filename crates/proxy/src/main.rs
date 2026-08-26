@@ -5,7 +5,8 @@ use tokio::{io, net::TcpListener};
 use crate::{
     balancer::{
         Balancer,
-        weight_round_robin::{Backend, WeightRoundRobinBalancer},
+        least_connections::{Backend as LeastConnectionsBackend, LeastConnectionsBalancer},
+        weight_round_robin::{Backend as WeightRoundRobinBackend, WeightRoundRobinBalancer},
     },
     pool::connection_pool::ConnectionPool,
 };
@@ -32,11 +33,20 @@ async fn main() -> io::Result<()> {
     // let balancer = Balancer::RoundRobin(RoundRobinBalancer::new(backends));
 
     // 2. WeightRoundRobin
-    let backend1 = Backend::new(addr1, 3);
-    let backend2 = Backend::new(addr2, 1);
+    // let backend1 = WeightRoundRobinBackend::new(addr1, 3);
+    // let backend2 = WeightRoundRobinBackend::new(addr2, 1);
+    // let backends = vec![backend1, backend2];
+
+    // let balancer = Balancer::Weighted(WeightRoundRobinBalancer::new(backends));
+
+    // 3. LeastConnections
+
+    let backend1 = LeastConnectionsBackend::new(addr1);
+    let backend2 = LeastConnectionsBackend::new(addr2);
+
     let backends = vec![backend1, backend2];
 
-    let balancer = Balancer::Weighted(WeightRoundRobinBalancer::new(backends));
+    let balancer = Balancer::LeastConnections(LeastConnectionsBalancer::new(backends));
 
     let arc_balancer = Arc::new(balancer);
 

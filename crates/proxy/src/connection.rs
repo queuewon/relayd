@@ -6,7 +6,7 @@ use tokio::{
 };
 
 use crate::{
-    balancer::{Balancer, BalancerError},
+    balancer::{Balancer, BalancerError, Selection},
     http::{
         error::{
             BodyKind,
@@ -75,7 +75,7 @@ pub async fn handle_connection(
     };
 
     // 백엔드 서버 연결 TODO: 별도 분리
-    let mut backend_conn = match connect_with_retry(&balancer, conn_pool).await {
+    let (mut backend_conn, _selection) = match connect_with_retry(&balancer, conn_pool).await {
         Ok(conn) => conn,
         Err(ConnectionError::AllBackendsUnreachable) => {
             eprintln!("백엔드 연결 실패");
@@ -181,6 +181,7 @@ pub async fn handle_connection(
     // 남은 바디를 목표치까지 스트리밍
     while total_received < target {
         let mut chunk = [0u8; 4096];
+        // TODO: 에러 발생시 backend_conn put() 수행 필요
         let n = backend_conn.stream.read(&mut chunk).await?;
         if n == 0 {
             return Err(ConnectionError::BackendClose);
@@ -197,14 +198,14 @@ pub async fn handle_connection(
 pub async fn connect_with_retry(
     balancer: &Arc<Balancer>,
     conn_pool: &Arc<ConnectionPool>,
-) -> Result<PooledConnection, ConnectionError> {
+) -> Result<(PooledConnection, Selection), ConnectionError> {
     if balancer.backend_count() == 0 {
         return Err(ConnectionError::NoBackendAvailable);
     }
 
     for _ in 0..balancer.backend_count() {
         let found_next_backend = balancer.next_backend();
-        let backend_addr = match found_next_backend {
+        let selection = match found_next_backend {
             Ok(addr) => addr,
             Err(e) => match e {
                 BalancerError::NoBackendAvailable => {
@@ -213,14 +214,14 @@ pub async fn connect_with_retry(
             },
         };
 
-        let found_conn = conn_pool.take(backend_addr).await;
+        let found_conn = conn_pool.take(selection.addr).await;
         match found_conn {
-            Some(conn) => return Ok(conn),
+            Some(conn) => return Ok((conn, selection)),
             None => {
-                let stream = match TcpStream::connect(backend_addr).await {
+                let stream = match TcpStream::connect(selection.addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("백엔드 {} 연결 실패: {}", backend_addr, e);
+                        eprintln!("백엔드 {} 연결 실패: {}", selection.addr, e);
                         continue;
                     }
                 };
@@ -231,13 +232,17 @@ pub async fn connect_with_retry(
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!(
-                            "백엔드 {backend_addr}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
+                            "백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
+                            selection.addr
                         );
                         return Err(e.into());
                     }
                 };
 
-                return Ok(PooledConnection::new(stream, permit, backend_addr));
+                return Ok((
+                    PooledConnection::new(stream, permit, selection.addr),
+                    selection,
+                ));
             }
         }
     }

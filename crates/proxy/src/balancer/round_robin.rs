@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::balancer::BalancerError;
+use crate::balancer::{BalancerError, Selection};
 
 pub struct RoundRobinBalancer {
     backends: Vec<SocketAddr>,
@@ -18,7 +18,7 @@ impl RoundRobinBalancer {
         }
     }
 
-    pub fn next_backend(&self) -> Result<SocketAddr, BalancerError> {
+    pub fn next_backend(&self) -> Result<Selection, BalancerError> {
         if self.backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
@@ -30,7 +30,7 @@ impl RoundRobinBalancer {
 
         let target = self.backends[index];
 
-        Ok(target)
+        Ok(Selection::without_guard(target))
     }
 
     pub fn backend_count(&self) -> usize {
