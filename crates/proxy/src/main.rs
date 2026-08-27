@@ -4,9 +4,11 @@ use tokio::{io, net::TcpListener};
 
 use crate::{balancer::Balancer, config::ProxyConfig, pool::connection_pool::ConnectionPool};
 
+pub mod backend;
 pub mod balancer;
 pub mod config;
 pub mod connection;
+pub mod health_check;
 pub mod http;
 pub mod pool;
 
@@ -19,6 +21,8 @@ async fn main() -> io::Result<()> {
     let config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
 
     let balancer = Balancer::from_config(config);
+
+    health_check::start_health_checks(&balancer);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
