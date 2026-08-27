@@ -6,28 +6,28 @@ use std::{
     },
 };
 
-use crate::balancer::{BalancerError, DecrementGuard, Selection};
+use crate::balancer::{Backend, BalancerError, DecrementGuard, Selection};
 
-pub struct Backend {
-    addr: SocketAddr,
+pub struct LeastConnectionsBackend {
+    base: Backend,
     active_connections: Arc<AtomicUsize>,
 }
 
-impl Backend {
+impl LeastConnectionsBackend {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
-            addr,
+            base: Backend::new(addr),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 // 여러 커넥션이 동시에 들어오면 같은 순간에 같은 백엔드를 최적이라고 판단해 둘 다 거기로 몰릴 수 있음
 pub struct LeastConnectionsBalancer {
-    backends: Vec<Backend>,
+    backends: Vec<LeastConnectionsBackend>,
 }
 
 impl LeastConnectionsBalancer {
-    pub fn new(backends: Vec<Backend>) -> Self {
+    pub fn new(backends: Vec<LeastConnectionsBackend>) -> Self {
         Self { backends }
     }
 
@@ -36,8 +36,16 @@ impl LeastConnectionsBalancer {
             return Err(BalancerError::NoBackendAvailable);
         }
 
-        let found_min_count_item = self
+        let health_backends: Vec<&LeastConnectionsBackend> = self
             .backends
+            .iter()
+            .filter(|b| b.base.healthy.load(Ordering::Relaxed))
+            .collect();
+        if health_backends.is_empty() {
+            return Err(BalancerError::NoBackendAvailable);
+        }
+
+        let found_min_count_item = health_backends
             .iter()
             .min_by_key(|b| b.active_connections.load(Ordering::Relaxed));
 
@@ -54,11 +62,15 @@ impl LeastConnectionsBalancer {
             counter: backend.active_connections.clone(),
         };
 
-        Ok(Selection::with_guard(backend.addr, guard))
+        Ok(Selection::with_guard(backend.base.addr, guard))
     }
 
     pub fn backend_count(&self) -> usize {
         self.backends.len()
+    }
+
+    pub fn healthy_targets(&self) -> Vec<Backend> {
+        self.backends.iter().map(|b| b.base.clone()).collect()
     }
 }
 
@@ -73,7 +85,10 @@ mod tests {
 
     #[test]
     fn selecting_increments_chosen_backend_counter() {
-        let backends = vec![Backend::new(addr(8081)), Backend::new(addr(8082))];
+        let backends = vec![
+            LeastConnectionsBackend::new(addr(8081)),
+            LeastConnectionsBackend::new(addr(8082)),
+        ];
         let balancer = LeastConnectionsBalancer::new(backends);
 
         let selection = balancer.next_backend().unwrap();
@@ -81,7 +96,7 @@ mod tests {
         let chosen = balancer
             .backends
             .iter()
-            .find(|b| b.addr == selection.addr)
+            .find(|b| b.base.addr == selection.addr)
             .unwrap();
 
         assert_eq!(chosen.active_connections.load(Ordering::Relaxed), 1);
@@ -89,7 +104,7 @@ mod tests {
 
     #[test]
     fn dropping_selection_decrements_counter() {
-        let backends = vec![Backend::new(addr(8081))];
+        let backends = vec![LeastConnectionsBackend::new(addr(8081))];
         let balancer = LeastConnectionsBalancer::new(backends);
 
         let selection = balancer.next_backend().unwrap();
@@ -118,7 +133,7 @@ mod tests {
             return Err(()); // 여기서 _selection이 스코프를 벗어나며 drop
         }
 
-        let backends = vec![Backend::new(addr(8081))];
+        let backends = vec![LeastConnectionsBackend::new(addr(8081))];
         let balancer = LeastConnectionsBalancer::new(backends);
 
         let result = simulate_early_error(&balancer);
@@ -134,7 +149,10 @@ mod tests {
 
     #[test]
     fn selects_backend_with_fewest_connections() {
-        let backends = vec![Backend::new(addr(8081)), Backend::new(addr(8082))];
+        let backends = vec![
+            LeastConnectionsBackend::new(addr(8081)),
+            LeastConnectionsBackend::new(addr(8082)),
+        ];
         let balancer = LeastConnectionsBalancer::new(backends);
 
         // 8081을 두 번 선택해서 인위적으로 부하를 올림 (drop 안 시키고 계속 들고 있음)

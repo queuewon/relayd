@@ -8,10 +8,11 @@ use std::{
 };
 
 use crate::{
+    backend::Backend,
     balancer::{
-        least_connections::{Backend as LeastConnectionsBackend, LeastConnectionsBalancer},
+        least_connections::{LeastConnectionsBackend, LeastConnectionsBalancer},
         round_robin::RoundRobinBalancer,
-        weight_round_robin::{Backend as WeightRoundRobinBackend, WeightRoundRobinBalancer},
+        weight_round_robin::{WeightRoundRobinBackend, WeightRoundRobinBalancer},
     },
     config::{self, ParsedBackendConfig, ProxyConfig},
 };
@@ -86,6 +87,13 @@ impl Balancer {
             Balancer::LeastConnections(balancer) => balancer.backend_count(),
         }
     }
+    pub fn healthy_targets(&self) -> Vec<Backend> {
+        match self {
+            Balancer::RoundRobin(balancer) => balancer.healthy_targets(),
+            Balancer::Weighted(balancer) => balancer.healthy_targets(),
+            Balancer::LeastConnections(balancer) => balancer.healthy_targets(),
+        }
+    }
 
     pub fn from_config(cfg: ProxyConfig) -> Self {
         let backend_configs: Vec<ParsedBackendConfig> = cfg
@@ -103,8 +111,10 @@ impl Balancer {
 
         let balancer = match cfg.algorithm {
             config::Algorithm::RoundRobin => {
-                let backends: Vec<SocketAddr> = backend_configs.iter().map(|b| b.addr).collect();
-
+                let backends: Vec<Backend> = backend_configs
+                    .iter()
+                    .map(|b| Backend::new(b.addr))
+                    .collect();
                 Balancer::RoundRobin(RoundRobinBalancer::new(backends))
             }
             config::Algorithm::Weighted => {

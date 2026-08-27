@@ -1,16 +1,19 @@
-use std::{net::SocketAddr, sync::Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Mutex, atomic::Ordering},
+};
 
-use crate::balancer::{BalancerError, Selection};
+use crate::balancer::{Backend, BalancerError, Selection};
 
-pub struct Backend {
-    addr: SocketAddr,
+pub struct WeightRoundRobinBackend {
+    base: Backend,
     current_weight: i32,
     weight: u8,
 }
-impl Backend {
+impl WeightRoundRobinBackend {
     pub fn new(addr: SocketAddr, weight: u8) -> Self {
         Self {
-            addr,
+            base: Backend::new(addr),
             current_weight: 0,
             weight,
         }
@@ -18,11 +21,11 @@ impl Backend {
 }
 
 pub struct WeightRoundRobinBalancer {
-    backends: Mutex<Vec<Backend>>,
+    backends: Mutex<Vec<WeightRoundRobinBackend>>,
 }
 
 impl WeightRoundRobinBalancer {
-    pub fn new(backends: Vec<Backend>) -> Self {
+    pub fn new(backends: Vec<WeightRoundRobinBackend>) -> Self {
         Self {
             backends: Mutex::new(backends),
         }
@@ -35,16 +38,24 @@ impl WeightRoundRobinBalancer {
             return Err(BalancerError::NoBackendAvailable);
         }
 
+        let mut health_backends: Vec<&mut WeightRoundRobinBackend> = guard
+            .iter_mut()
+            .filter(|b| b.base.healthy.load(Ordering::Relaxed))
+            .collect();
+        if health_backends.is_empty() {
+            return Err(BalancerError::NoBackendAvailable);
+        }
+
         let mut total_weight: i32 = 0;
 
-        for backend in guard.iter_mut() {
+        for backend in health_backends.iter_mut() {
             let weight = backend.weight as i32;
             backend.current_weight += weight;
 
             total_weight += backend.weight as i32;
         }
 
-        let found_max_current_weight_item = guard
+        let found_max_current_weight_item = health_backends
             .iter_mut()
             .max_by_key(|backend| backend.current_weight);
 
@@ -57,12 +68,17 @@ impl WeightRoundRobinBalancer {
 
         max_current_weight_item.current_weight -= total_weight as i32;
 
-        Ok(Selection::without_guard(max_current_weight_item.addr))
+        Ok(Selection::without_guard(max_current_weight_item.base.addr))
     }
 
     pub fn backend_count(&self) -> usize {
         let guard = self.backends.lock().unwrap();
         guard.len()
+    }
+
+    pub fn healthy_targets(&self) -> Vec<Backend> {
+        let lock = self.backends.lock().unwrap();
+        lock.iter().map(|b| b.base.clone()).collect()
     }
 }
 
