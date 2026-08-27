@@ -1,0 +1,9 @@
+algorithm = "weighted"
+
+[[backends]]
+addr = "127.0.0.1:8081"
+weight = 3
+
+[[backends]]
+addr = "127.0.0.1:8082"
+weight = 1

@@ -12,8 +12,10 @@ pub mod pool;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let content =
-        std::fs::read_to_string("crates/proxy/config.toml").expect("프록시 설정파일 불러오기 실패");
+    let path = std::env::args()
+        .nth(1)
+        .expect("config 파일 설정 경로를 인자로 지정하는 작업이 필요");
+    let content = std::fs::read_to_string(path).expect("프록시 설정파일 불러오기 실패");
     let config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
 
     let balancer = Balancer::from_config(config);
