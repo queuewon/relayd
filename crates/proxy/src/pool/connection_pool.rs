@@ -131,7 +131,7 @@ impl ConnectionPool {
 
         if let Ok(mut guard) = lock {
             for conns in guard.values_mut() {
-                conns.retain(|conn| conn.returned_at.elapsed() > max_idle);
+                conns.retain(|conn| conn.returned_at.elapsed() < max_idle);
             }
         }
     }
