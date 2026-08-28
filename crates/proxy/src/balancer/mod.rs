@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     str::FromStr,
     sync::{
@@ -63,18 +64,21 @@ pub enum Balancer {
     LeastConnections(LeastConnectionsBalancer),
 }
 impl Balancer {
-    pub fn next_backend(&self) -> Result<Selection, BalancerError> {
+    pub fn next_backend(
+        &self,
+        failed_backends: &HashSet<SocketAddr>,
+    ) -> Result<Selection, BalancerError> {
         match self {
             Balancer::RoundRobin(balancer) => {
-                let backend = balancer.next_backend()?;
+                let backend = balancer.next_backend(failed_backends)?;
                 Ok(backend)
             }
             Balancer::Weighted(balancer) => {
-                let backend = balancer.next_backend()?;
+                let backend = balancer.next_backend(failed_backends)?;
                 Ok(backend)
             }
             Balancer::LeastConnections(balancer) => {
-                let backend = balancer.next_backend()?;
+                let backend = balancer.next_backend(failed_backends)?;
                 Ok(backend)
             }
         }

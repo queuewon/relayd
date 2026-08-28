@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -108,7 +108,7 @@ pub async fn handle_connection(
     let mut ser_req_buf = request::serialize_headers(&parsed_req.header);
 
     let body_read_result =
-        request::read_body(&mut backend_conn.stream, &parsed_req, &mut client_buf).await;
+        request::read_body(&mut client_stream, &parsed_req, &mut client_buf).await;
     let body_kind = match body_read_result {
         Ok(kind) => kind,
         Err(e) => {
@@ -181,8 +181,8 @@ pub async fn handle_connection(
     // 남은 바디를 목표치까지 스트리밍
     while total_received < target {
         let mut chunk = [0u8; 4096];
-        // TODO: 에러 발생시 backend_conn put() 수행 필요
         let n = backend_conn.stream.read(&mut chunk).await?;
+        // 백엔드가 응답을 전부 하지 못하고 스트림을 끊었으니 어디까지 왔고 어디서 끝나는지"가 불확실한 상태이기에 해당 커넥션은 drop
         if n == 0 {
             return Err(ConnectionError::BackendClose);
         }
@@ -203,8 +203,10 @@ pub async fn connect_with_retry(
         return Err(ConnectionError::NoBackendAvailable);
     }
 
+    let mut failed_backends: HashSet<SocketAddr> = HashSet::new();
+
     for _ in 0..balancer.backend_count() {
-        let found_next_backend = balancer.next_backend();
+        let found_next_backend = balancer.next_backend(&failed_backends);
         let selection = match found_next_backend {
             Ok(addr) => addr,
             Err(e) => match e {
@@ -221,21 +223,22 @@ pub async fn connect_with_retry(
                 let stream = match TcpStream::connect(selection.addr).await {
                     Ok(s) => s,
                     Err(e) => {
+                        failed_backends.insert(selection.addr);
                         eprintln!("백엔드 {} 연결 실패: {}", selection.addr, e);
                         continue;
                     }
                 };
 
                 let timeout = Duration::new(5, 0);
-                // TODO: 다른 백엔드로의 재시도
                 let permit = match conn_pool.acquire_permit(timeout).await {
                     Ok(p) => p,
                     Err(e) => {
+                        failed_backends.insert(selection.addr);
                         eprintln!(
                             "백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
                             selection.addr
                         );
-                        return Err(e.into());
+                        continue;
                     }
                 };
 

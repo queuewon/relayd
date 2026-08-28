@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     sync::{Mutex, atomic::Ordering},
 };
@@ -31,31 +32,35 @@ impl WeightRoundRobinBalancer {
         }
     }
 
-    pub fn next_backend(&self) -> Result<Selection, BalancerError> {
+    pub fn next_backend(
+        &self,
+        failed_backends: &HashSet<SocketAddr>,
+    ) -> Result<Selection, BalancerError> {
         let mut guard = self.backends.lock().unwrap();
 
         if guard.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
 
-        let mut health_backends: Vec<&mut WeightRoundRobinBackend> = guard
+        let mut available_backends: Vec<&mut WeightRoundRobinBackend> = guard
             .iter_mut()
+            .filter(|b| !failed_backends.contains(&b.base.addr))
             .filter(|b| b.base.healthy.load(Ordering::Relaxed))
             .collect();
-        if health_backends.is_empty() {
+        if available_backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
 
         let mut total_weight: i32 = 0;
 
-        for backend in health_backends.iter_mut() {
+        for backend in available_backends.iter_mut() {
             let weight = backend.weight as i32;
             backend.current_weight += weight;
 
             total_weight += backend.weight as i32;
         }
 
-        let found_max_current_weight_item = health_backends
+        let found_max_current_weight_item = available_backends
             .iter_mut()
             .max_by_key(|backend| backend.current_weight);
 

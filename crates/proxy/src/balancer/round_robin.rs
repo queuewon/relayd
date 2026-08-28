@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     backend::Backend,
@@ -18,26 +22,30 @@ impl RoundRobinBalancer {
         }
     }
 
-    pub fn next_backend(&self) -> Result<Selection, BalancerError> {
+    pub fn next_backend(
+        &self,
+        failed_backends: &HashSet<SocketAddr>,
+    ) -> Result<Selection, BalancerError> {
         if self.backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
 
-        let health_backends: Vec<&Backend> = self
+        let available_backends: Vec<&Backend> = self
             .backends
             .iter()
+            .filter(|b| !failed_backends.contains(&b.addr))
             .filter(|b| b.healthy.load(Ordering::Relaxed))
             .collect();
-        if health_backends.is_empty() {
+        if available_backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
 
         // 중간에 다른 스레드가 끼어들 수 있으므로 읽음+증가 동시에 해줘야 함
         // fetch_add는 값이 타입의 최댓값을 넘어서면 wrapping(감싸돌기) 방식으로 동작하므로 별도 usize 최대값 처리 불필요
         let old_counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        let index = old_counter % health_backends.len();
+        let index = old_counter % available_backends.len();
 
-        let target = health_backends[index];
+        let target = available_backends[index];
 
         Ok(Selection::without_guard(target.addr))
     }
