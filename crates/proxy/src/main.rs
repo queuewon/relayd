@@ -28,7 +28,7 @@ async fn main() -> io::Result<()> {
 
     let arc_balancer = Arc::new(balancer);
 
-    let conn_pool = Arc::new(ConnectionPool::new(10));
+    let conn_pool = Arc::new(ConnectionPool::new(20));
 
     let max_idle = Duration::new(5, 0);
     let interval = Duration::new(10, 0);
