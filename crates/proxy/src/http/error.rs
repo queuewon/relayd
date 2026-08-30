@@ -15,7 +15,8 @@ pub enum ConnectionError {
     PoolAcquireTimeout,       // 풀에서 permit을 timeout 안에 못 얻음
 
     MalformedResponse(String),
-    BackendClose,
+    BackendClosedBeforeResponse, // 응답 헤더 받기 전 백엔드 연결이 끊어짐.
+    BackendClosedMidResponse,    // 헤더, 바디 일부를 클라이언트에 write 후 백엔드가 연결이 끊어짐.
 }
 impl From<io::Error> for ConnectionError {
     fn from(e: io::Error) -> Self {

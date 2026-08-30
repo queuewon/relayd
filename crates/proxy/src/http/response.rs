@@ -30,7 +30,7 @@ pub async fn parse_backend_header(
         // 백엔드가 연결을 맺었다가 완전히 닫아버린 경우(정상 종료든, 갑자기 끊기든, 악의적 공격이든) 처리. 0이면 연결이 끊긴 것임.
         if n == 0 {
             eprintln!("Backend closed the connection");
-            return Err(ConnectionError::BackendClose);
+            return Err(ConnectionError::BackendClosedBeforeResponse);
         }
 
         // 헤더 버퍼 초기화
