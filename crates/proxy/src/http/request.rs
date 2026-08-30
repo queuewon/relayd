@@ -73,7 +73,7 @@ pub fn serialize_headers(req: &RequestHeaderParseResult) -> Vec<u8> {
         ser_req.extend_from_slice(&header.1);
         ser_req.extend_from_slice(b"\r\n");
     }
-    ser_req.extend_from_slice(b"\r\n\r\n");
+    ser_req.extend_from_slice(b"\r\n");
 
     ser_req
 }
