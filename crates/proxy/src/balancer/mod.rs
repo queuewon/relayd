@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    backend::Backend,
+    backend::{Backend, HealthPolicy, Threshold},
     balancer::{
         least_connections::{LeastConnectionsBackend, LeastConnectionsBalancer},
         round_robin::RoundRobinBalancer,
@@ -34,20 +34,23 @@ impl Drop for DecrementGuard {
 
 // 밸런서 별 백엔드 구조체에 DecrementGuard를 추가하려 했으나, 백엔드 서버가 실제로 죽어야만 drop 되므로 Selection
 pub struct Selection {
-    pub addr: SocketAddr,
+    pub backend: Backend,
     _guard: Option<DecrementGuard>,
 }
 
 impl Selection {
     // RR/WRR처럼 감소시킬 게 없는 경우
-    fn without_guard(addr: SocketAddr) -> Self {
-        Self { addr, _guard: None }
+    fn without_guard(backend: Backend) -> Self {
+        Self {
+            backend,
+            _guard: None,
+        }
     }
 
     // LeastConnections처럼 감소가 필요한 경우
-    fn with_guard(addr: SocketAddr, guard: DecrementGuard) -> Self {
+    fn with_guard(backend: Backend, guard: DecrementGuard) -> Self {
         Self {
-            addr,
+            backend,
             _guard: Some(guard),
         }
     }
@@ -91,11 +94,11 @@ impl Balancer {
             Balancer::LeastConnections(balancer) => balancer.backend_count(),
         }
     }
-    pub fn healthy_targets(&self) -> Vec<Backend> {
+    pub fn all_backends(&self) -> Vec<Backend> {
         match self {
-            Balancer::RoundRobin(balancer) => balancer.healthy_targets(),
-            Balancer::Weighted(balancer) => balancer.healthy_targets(),
-            Balancer::LeastConnections(balancer) => balancer.healthy_targets(),
+            Balancer::RoundRobin(balancer) => balancer.all_backends(),
+            Balancer::Weighted(balancer) => balancer.all_backends(),
+            Balancer::LeastConnections(balancer) => balancer.all_backends(),
         }
     }
 
@@ -113,25 +116,36 @@ impl Balancer {
             })
             .collect();
 
+        let health_policy = HealthPolicy {
+            probe: Threshold {
+                health: 3,
+                unhealth: 3,
+            },
+            traffic: Threshold {
+                health: 2,
+                unhealth: 5,
+            },
+        };
+
         let balancer = match cfg.algorithm {
             config::Algorithm::RoundRobin => {
                 let backends: Vec<Backend> = backend_configs
                     .iter()
-                    .map(|b| Backend::new(b.addr))
+                    .map(|b| Backend::new(b.addr, health_policy))
                     .collect();
                 Balancer::RoundRobin(RoundRobinBalancer::new(backends))
             }
             config::Algorithm::Weighted => {
                 let backends: Vec<WeightRoundRobinBackend> = backend_configs
                     .iter()
-                    .map(|b| WeightRoundRobinBackend::new(b.addr, b.weight))
+                    .map(|b| WeightRoundRobinBackend::new(b.addr, b.weight, health_policy))
                     .collect();
                 Balancer::Weighted(WeightRoundRobinBalancer::new(backends))
             }
             config::Algorithm::LeastConnections => {
                 let backends: Vec<LeastConnectionsBackend> = backend_configs
                     .iter()
-                    .map(|b| LeastConnectionsBackend::new(b.addr))
+                    .map(|b| LeastConnectionsBackend::new(b.addr, health_policy))
                     .collect();
                 Balancer::LeastConnections(LeastConnectionsBalancer::new(backends))
             }

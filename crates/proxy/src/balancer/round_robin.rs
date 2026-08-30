@@ -34,7 +34,7 @@ impl RoundRobinBalancer {
             .backends
             .iter()
             .filter(|b| !failed_backends.contains(&b.addr))
-            .filter(|b| b.healthy.load(Ordering::Relaxed))
+            .filter(|b| b.is_routable())
             .collect();
         if available_backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
@@ -47,14 +47,14 @@ impl RoundRobinBalancer {
 
         let target = available_backends[index];
 
-        Ok(Selection::without_guard(target.addr))
+        Ok(Selection::without_guard(target.clone()))
     }
 
     pub fn backend_count(&self) -> usize {
         self.backends.len()
     }
 
-    pub fn healthy_targets(&self) -> Vec<Backend> {
+    pub fn all_backends(&self) -> Vec<Backend> {
         self.backends.clone()
     }
 }

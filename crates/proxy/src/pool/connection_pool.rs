@@ -17,6 +17,7 @@ use crate::http::error::PoolError;
 
 pub struct PooledConnection {
     pub stream: TcpStream,
+    pub reused: bool, // 재사용 커넥션 여부
 
     backend_addr: SocketAddr,
 
@@ -38,6 +39,7 @@ impl PooledConnection {
             backend_addr,
             permit,
             returned_at: Instant::now(),
+            reused: false,
         }
     }
 }

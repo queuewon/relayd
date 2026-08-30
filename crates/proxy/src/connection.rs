@@ -64,18 +64,14 @@ pub async fn handle_connection(
                 let _ = client_stream.shutdown().await;
                 return Err(ConnectionError::MalformedRequest(mre));
             }
-            ConnectionError::AllBackendsUnreachable
-            | ConnectionError::NoBackendAvailable
-            | ConnectionError::PoolAcquireTimeout
-            | ConnectionError::MalformedResponse(_)
-            | ConnectionError::BackendClose => {
+            _ => {
                 unreachable!("parse_client_header는 이 에러를 반환하지 않음");
             }
         }
     };
 
     // 백엔드 서버 연결 TODO: 별도 분리
-    let (mut backend_conn, _selection) = match connect_with_retry(&balancer, conn_pool).await {
+    let (mut backend_conn, selection) = match connect_with_retry(balancer, conn_pool).await {
         Ok(conn) => conn,
         Err(ConnectionError::AllBackendsUnreachable) => {
             eprintln!("백엔드 연결 실패");
@@ -130,11 +126,7 @@ pub async fn handle_connection(
                     let _ = client_stream.shutdown().await;
                     return Err(ConnectionError::MalformedRequest(mre));
                 }
-                ConnectionError::AllBackendsUnreachable
-                | ConnectionError::NoBackendAvailable
-                | ConnectionError::PoolAcquireTimeout
-                | ConnectionError::MalformedResponse(_)
-                | ConnectionError::BackendClose => {
+                _ => {
                     unreachable!("read_body는 이 에러를 반환하지 않음");
                 }
             };
@@ -143,24 +135,34 @@ pub async fn handle_connection(
 
     // 클라이언트 -> 백엔드 데이터 전송
     match body_kind {
-        BodyKind::None => {
-            backend_conn.stream.write_all(&ser_req_buf).await.unwrap();
-        }
+        BodyKind::None => {}
         BodyKind::ContentLength(content_len) => {
             let header_idx = parsed_req.header.header_end;
             let body_idx = header_idx + content_len;
-
-            let body = &client_buf[header_idx..body_idx];
-
-            ser_req_buf.extend_from_slice(body);
-            backend_conn.stream.write_all(&ser_req_buf).await.unwrap();
+            ser_req_buf.extend_from_slice(&client_buf[header_idx..body_idx]);
         }
         BodyKind::Chunked => todo!(),
     };
 
+    // 완성된 버퍼를 한 번만 전송
+    if let Err(e) = backend_conn.stream.write_all(&ser_req_buf).await {
+        selection.backend.note_traffic_result(false);
+        eprintln!("클라이언트 -> 백엔드 데이터 전송 실패: {}", e);
+        return Err(ConnectionError::Io(e));
+    }
+
     // 백엔드 -> 클라이언트 데이터 전송
     let mut backend_buf: Vec<u8> = Vec::new(); // 응답 데이터 파싱 전용 buf
-    let parsed_res = parse_backend_header(&mut backend_conn.stream, &mut backend_buf).await?;
+    let parsed_backend_header_result =
+        parse_backend_header(&mut backend_conn.stream, &mut backend_buf).await;
+    let parsed_res = match parsed_backend_header_result {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("백엔드 헤더 파싱 실패: {:#?}", e);
+            selection.backend.note_traffic_result(false);
+            return Err(e);
+        }
+    };
 
     // Content-Length 찾기
     let content_length: usize = parsed_res
@@ -181,14 +183,34 @@ pub async fn handle_connection(
     // 남은 바디를 목표치까지 스트리밍
     while total_received < target {
         let mut chunk = [0u8; 4096];
-        let n = backend_conn.stream.read(&mut chunk).await?;
-        // 백엔드가 응답을 전부 하지 못하고 스트림을 끊었으니 어디까지 왔고 어디서 끝나는지"가 불확실한 상태이기에 해당 커넥션은 drop
+        let read_backend_body_result = backend_conn.stream.read(&mut chunk).await;
+        let n = match read_backend_body_result {
+            Ok(n) => n,
+            Err(e) => {
+                selection.backend.note_traffic_result(false);
+                eprintln!("백엔드 응답 body read 실패: {}", e);
+                return Err(e.into());
+            }
+        };
+        // 백엔드가 응답을 전부 하지 못하고 스트림을 끊었으니 어디까지 왔고 어디서 끝나는지가 불확실한 상태이기에 해당 커넥션은 drop
         if n == 0 {
-            return Err(ConnectionError::BackendClose);
+            selection.backend.note_traffic_result(false);
+            return Err(ConnectionError::BackendClosedMidResponse);
         }
+
         client_stream.write_all(&chunk[..n]).await?;
         total_received += n;
     }
+
+    // HTTP 레벨에서는 정상적인 응답이므로 백엔드 커넥션을 풀에 반납하도록 함.
+    let backend_ok = !matches!(parsed_res.code, 502 | 503 | 504);
+    if !backend_ok {
+        println!(
+            "from : {} 응답 오류, status code: {}",
+            selection.backend.addr, parsed_res.code
+        );
+    }
+    selection.backend.note_traffic_result(backend_ok);
 
     conn_pool.put(backend_conn).await;
 
@@ -215,35 +237,44 @@ pub async fn connect_with_retry(
                 }
             },
         };
+        println!("백엔드 {} 선택", selection.backend.addr);
 
-        let found_conn = conn_pool.take(selection.addr).await;
+        let found_conn = conn_pool.take(selection.backend.addr).await;
         match found_conn {
-            Some(conn) => return Ok((conn, selection)),
+            Some(mut conn) => {
+                conn.reused = true;
+                return Ok((conn, selection));
+            }
             None => {
-                let stream = match TcpStream::connect(selection.addr).await {
+                let stream = match TcpStream::connect(selection.backend.addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        failed_backends.insert(selection.addr);
-                        eprintln!("백엔드 {} 연결 실패: {}", selection.addr, e);
+                        selection.backend.note_traffic_result(false);
+                        failed_backends.insert(selection.backend.addr);
+                        eprintln!("백엔드 {} 연결 실패: {}", selection.backend.addr, e);
                         continue;
                     }
                 };
 
                 let timeout = Duration::new(5, 0);
+
                 let permit = match conn_pool.acquire_permit(timeout).await {
                     Ok(p) => p,
                     Err(e) => {
-                        failed_backends.insert(selection.addr);
+                        // 프록시 측 자원 고갈 문제이기에 수동 헬스체크 미수행
+                        failed_backends.insert(selection.backend.addr);
                         eprintln!(
                             "백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
-                            selection.addr
+                            selection.backend.addr
                         );
                         continue;
                     }
                 };
 
+                // handle_connection에서 백엔드로 데이터를 보내고 나서야 비로소 올바른 헬스체크라 판단하여 해당 메소드에서는 success 수동 헬스체크 미수행
+
                 return Ok((
-                    PooledConnection::new(stream, permit, selection.addr),
+                    PooledConnection::new(stream, permit, selection.backend.addr),
                     selection,
                 ));
             }

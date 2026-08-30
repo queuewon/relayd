@@ -1,10 +1,9 @@
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    sync::{Mutex, atomic::Ordering},
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Mutex};
 
-use crate::balancer::{Backend, BalancerError, Selection};
+use crate::{
+    backend::HealthPolicy,
+    balancer::{Backend, BalancerError, Selection},
+};
 
 pub struct WeightRoundRobinBackend {
     base: Backend,
@@ -12,9 +11,9 @@ pub struct WeightRoundRobinBackend {
     weight: u8,
 }
 impl WeightRoundRobinBackend {
-    pub fn new(addr: SocketAddr, weight: u8) -> Self {
+    pub fn new(addr: SocketAddr, weight: u8, health_policy: HealthPolicy) -> Self {
         Self {
-            base: Backend::new(addr),
+            base: Backend::new(addr, health_policy),
             current_weight: 0,
             weight,
         }
@@ -45,7 +44,7 @@ impl WeightRoundRobinBalancer {
         let mut available_backends: Vec<&mut WeightRoundRobinBackend> = guard
             .iter_mut()
             .filter(|b| !failed_backends.contains(&b.base.addr))
-            .filter(|b| b.base.healthy.load(Ordering::Relaxed))
+            .filter(|b| b.base.is_routable())
             .collect();
         if available_backends.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
@@ -73,7 +72,9 @@ impl WeightRoundRobinBalancer {
 
         max_current_weight_item.current_weight -= total_weight as i32;
 
-        Ok(Selection::without_guard(max_current_weight_item.base.addr))
+        Ok(Selection::without_guard(
+            max_current_weight_item.base.clone(),
+        ))
     }
 
     pub fn backend_count(&self) -> usize {
@@ -81,7 +82,7 @@ impl WeightRoundRobinBalancer {
         guard.len()
     }
 
-    pub fn healthy_targets(&self) -> Vec<Backend> {
+    pub fn all_backends(&self) -> Vec<Backend> {
         let lock = self.backends.lock().unwrap();
         lock.iter().map(|b| b.base.clone()).collect()
     }
