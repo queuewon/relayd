@@ -1,4 +1,5 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, web};
+use serde::Deserialize;
 use std::{
     env,
     sync::atomic::{AtomicBool, Ordering},
@@ -9,6 +10,11 @@ struct Config {
     name: String,
     delay_ms: usize,
     fail_requests: AtomicBool,
+}
+
+#[derive(Deserialize)]
+struct SlowBodyReqQuery {
+    duration: usize,
 }
 
 #[get("/")]
@@ -36,6 +42,7 @@ async fn fail_on(cfg: web::Data<Config>) -> impl Responder {
     cfg.fail_requests.store(true, Ordering::Relaxed);
     HttpResponse::Ok().body(format!("fail on: {}", cfg.name))
 }
+
 #[get("/fail-off")]
 async fn fail_off(cfg: web::Data<Config>) -> impl Responder {
     cfg.fail_requests.store(false, Ordering::Relaxed);
@@ -53,6 +60,27 @@ async fn error() -> impl Responder {
     HttpResponse::InternalServerError().body("error")
 }
 
+#[get("/slow-body")]
+async fn slow_body(cfg: web::Data<Config>, query: web::Query<SlowBodyReqQuery>) -> impl Responder {
+    let name = cfg.name.clone();
+    let per_chunk = Duration::from_millis(query.duration as u64 * 1000 / 10);
+
+    let s = futures::stream::unfold(0usize, move |i| {
+        let name = name.clone();
+        async move {
+            if i >= 10 {
+                return None;
+            }
+            tokio::time::sleep(per_chunk).await;
+            Some((
+                Ok::<_, actix_web::Error>(web::Bytes::from(format!("chunk{i} from {name}\n"))),
+                i + 1,
+            ))
+        }
+    });
+
+    HttpResponse::Ok().streaming(s)
+}
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -79,6 +107,7 @@ async fn main() -> std::io::Result<()> {
             .service(fail_on)
             .service(fail_off)
             .service(slow)
+            .service(slow_body)
             .service(error)
     })
     .bind(("127.0.0.1", port))?
