@@ -1,4 +1,9 @@
+// TODO 1.: 무한 partial 우려: httpparse는 공백으로 헤더 종결을 구분하는데 악의적 요청, 클라이언트의 요청이 지속적으로 부분적으로만 오는 경우 (떠오르는 방안: 타임아웃) -> 이건 추후 고려
+// TODO 2.: X-forwarded-for 의 경우 이전 프록시에서 거쳐왔을 수도 있으나, 현재는 일단 추가만 하는 방식
+
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+
+const MAX_CHUNK_HEADER_SIZE: usize = 64;
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,6 +24,15 @@ use crate::{
     },
     pool::connection_pool::{ConnectionPool, PooledConnection},
 };
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkParseState {
+    ReadingSize, // 16진수 크기 문자열을 읽는 단계
+    CheckingLf,  // \r 이후 \n이 맞는지 확인하는 단계
+    ReadingData, // 파싱된 크기만큼 실제 데이터를 모으는 단계
+    DataEndCr,   // 데이터가 끝난 후 \r 마감을 확인하는 단계
+    DataEndLf,   // 데이터가 끝난 후 \n 마감을 확인하는 단계
+}
 
 pub async fn handle_connection(
     mut client_stream: TcpStream,
@@ -41,9 +55,7 @@ pub async fn handle_connection(
         body: Vec::new(),
     };
 
-    // TODO 1.: 무한 partial 우려: httpparse는 공백으로 헤더 종결을 구분하는데 악의적 요청, 클라이언트의 요청이 지속적으로 부분적으로만 오는 경우 (떠오르는 방안: 타임아웃) -> 이건 추후 고려
-    // TODO 2.: Content-Length가 있으면 그만큼 읽고 청크 인코딩이면 청크 단위로 읽기
-    // TODO 3.: X-forwarded-for 의 경우 이전 프록시에서 거쳐왔을 수도 있으나, 현재는 일단 추가만 하는 방식
+    // 1. 클라이언트 요청 헤더 파싱
     if let Err(e) =
         request::parse_client_header(&mut client_stream, &mut parsed_req, &mut client_buf).await
     {
@@ -71,7 +83,7 @@ pub async fn handle_connection(
         }
     };
 
-    // 백엔드 서버 연결 TODO: 별도 분리
+    // 2. 백엔드 연결
     let (mut backend_conn, selection) = match connect_with_retry(balancer, conn_pool).await {
         Ok(conn) => conn,
         Err(ConnectionError::AllBackendsUnreachable) => {
@@ -95,15 +107,16 @@ pub async fn handle_connection(
         Err(e) => return Err(e), // connect_with_retry가 다른 variant는 반환 안 하지만 방어적으로
     };
 
-    // X-Forwarded-For 추가
+    // 3. 파싱된 클라이언트 헤더에 X-Forwarded-For 헤더 추가
     let xff_name = "X-Forwarded-For".to_string();
     let xff_value = client_addr.ip().to_string().as_bytes().to_vec();
 
     parsed_req.header.headers.push((xff_name, xff_value));
 
-    // HTTP 요청 헤더 직렬화
+    // 4. 클라이언트 요청 헤더 직렬화 (바이트 벡터)
     let mut ser_req_buf = request::serialize_headers(&parsed_req.header);
 
+    // 5. 클라이언트 요청 바디 read
     let body_read_result =
         request::read_body(&mut client_stream, &parsed_req, &mut client_buf).await;
     let body_kind = match body_read_result {
@@ -134,6 +147,7 @@ pub async fn handle_connection(
         }
     };
 
+    // 6. 바디 값 종류 구분
     match body_kind {
         BodyKind::None => {}
         BodyKind::ContentLength(content_len) => {
@@ -144,7 +158,7 @@ pub async fn handle_connection(
         BodyKind::Chunked => todo!(),
     };
 
-    // 클라이언트 <-> 백엔드 간 데이터 스트리밍
+    // 7. 클라이언트 <-> 백엔드 간 데이터 스트리밍
     let future = send_and_relay_response(
         &mut client_stream,
         &mut backend_conn.stream,
@@ -185,6 +199,7 @@ pub async fn handle_connection(
         }
     };
 
+    // 8. 백엔드 커넥션을 풀에 반납.
     // HTTP 레벨에서는 정상적인 응답이므로 백엔드 커넥션을 풀에 반납하도록 함.
     let backend_ok = !matches!(parsed_res.code, 502 | 503 | 504);
     if !backend_ok {
@@ -193,6 +208,8 @@ pub async fn handle_connection(
             selection.backend.addr, parsed_res.code
         );
     }
+
+    // 8.1. 수동 헬스 체크 성공 기록
     selection.backend.note_traffic_result(backend_ok);
 
     conn_pool.put(backend_conn).await;
@@ -289,6 +306,7 @@ async fn send_and_relay_response(
     req_bytes: &[u8],
     selection: &Selection,
 ) -> Result<ResponseHeaderParseResult, ConnectionError> {
+    // 1. 클라이언트 -> 백엔드 데이터 전송
     if let Err(e) = backend_stream.write_all(req_bytes).await {
         selection.backend.note_traffic_result(false);
         eprintln!("클라이언트 -> 백엔드 데이터 전송 실패: {}", e);
@@ -298,6 +316,7 @@ async fn send_and_relay_response(
     let mut backend_buf: Vec<u8> = Vec::new(); // 응답 데이터 파싱 전용 buf
     let response_header_timeout = Duration::from_secs(5);
 
+    // 2. 백엔드 헤더 파싱 (타임아웃)
     let future = parse_backend_header(backend_stream, &mut backend_buf);
     let timeout_result = tokio::time::timeout(response_header_timeout, future).await;
     let parsed_backend_header_result = match timeout_result {
@@ -329,24 +348,52 @@ async fn send_and_relay_response(
         }
     };
 
-    // Content-Length 찾기
-    let content_length: usize = parsed_res
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
-        .and_then(|(_, value)| std::str::from_utf8(value).ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    // 헤더 블록이 끝난 지점 + 바디 길이 = 응답 전체가 끝나는 바이트 위치
-    let target = parsed_res.header_end + content_length;
-
-    // 헤더 + 이미 도착해 있던 바디 일부를 먼저 클라이언트에게 전달
+    // 3. 헤더 + 이미 도착해 있던 바디 일부를 먼저 클라이언트에게 전달
     client_stream.write_all(&backend_buf).await?;
-    let mut total_received = backend_buf.len();
 
-    // 남은 바디를 목표치까지 스트리밍
-    while total_received < target {
+    // 4. 바디 종류 확인
+    let body_kind = detect_body_kind(&parsed_res.headers)?;
+
+    // 5. 바디 프레이밍 종류별 스트리밍 수행
+    match body_kind {
+        BodyKind::ContentLength(length) => {
+            // 헤더 블록이 끝난 지점 + 바디 길이 = 응답 전체가 끝나는 바이트 위치
+
+            relay_sized_body(
+                client_stream,
+                backend_stream,
+                &backend_buf[parsed_res.header_end..],
+                length,
+                selection,
+            )
+            .await?;
+        }
+        BodyKind::Chunked => {
+            relay_chunked_body(
+                client_stream,
+                backend_stream,
+                &backend_buf[parsed_res.header_end..],
+                selection,
+            )
+            .await?;
+        }
+        BodyKind::None => {}
+    };
+
+    Ok(parsed_res)
+}
+
+async fn relay_sized_body(
+    client_stream: &mut TcpStream,
+    backend_stream: &mut TcpStream,
+    initial_body: &[u8],
+    length: usize,
+    selection: &Selection,
+) -> Result<(), ConnectionError> {
+    // Content-Length 응답의 바디는 그냥 연속된 바이트 덩어리. 이미 write한 데이터까지 계속 쌓여서 같은 데이터를 중복 전송, 응답이 크면 메모리 낭비이므로 청크를 초기화, 전송, 폐기 반복
+    let mut total_received = initial_body.len();
+
+    while total_received < length {
         let mut chunk = [0u8; 4096];
         let read_backend_body_result = backend_stream.read(&mut chunk).await;
         let n = match read_backend_body_result {
@@ -357,6 +404,7 @@ async fn send_and_relay_response(
                 return Err(e.into());
             }
         };
+
         // 백엔드가 응답을 전부 하지 못하고 스트림을 끊었으니 어디까지 왔고 어디서 끝나는지가 불확실한 상태이기에 해당 커넥션은 drop
         if n == 0 {
             selection.backend.note_traffic_result(false);
@@ -367,5 +415,175 @@ async fn send_and_relay_response(
         total_received += n;
     }
 
-    Ok(parsed_res)
+    Ok(())
+}
+
+pub async fn relay_chunked_body(
+    client_stream: &mut TcpStream,
+    backend_stream: &mut TcpStream,
+    initial_body: &[u8],
+    selection: &Selection,
+) -> Result<(), ConnectionError> {
+    let mut stream_buffer = initial_body.to_vec();
+    let mut read_buf = [0u8; 4096];
+
+    let mut state = ChunkParseState::ReadingSize;
+    let mut size_bytes = Vec::new();
+    let mut data_bytes = Vec::new();
+    let mut decimal_size: usize = 0;
+    let mut parse_idx = 0;
+
+    loop {
+        while parse_idx < stream_buffer.len() {
+            let b = stream_buffer[parse_idx];
+            parse_idx += 1;
+
+            match state {
+                ChunkParseState::ReadingSize => {
+                    if b == b'\r' {
+                        state = ChunkParseState::CheckingLf;
+                    } else {
+                        if size_bytes.len() >= MAX_CHUNK_HEADER_SIZE {
+                            return Err(ConnectionError::MalformedResponse(
+                                "청크 크기 줄 길이 상한 초과".to_string(),
+                            ));
+                        }
+                        size_bytes.push(b);
+                    }
+                }
+
+                ChunkParseState::CheckingLf => {
+                    if b == b'\n' {
+                        let raw_str = str::from_utf8(&size_bytes)
+                            .map_err(|e| ConnectionError::MalformedResponse(e.to_string()))?;
+
+                        let clean_hex_str = match raw_str.find(';') {
+                            Some(semi_idx) => &raw_str[..semi_idx],
+                            None => raw_str,
+                        };
+
+                        decimal_size =
+                            usize::from_str_radix(clean_hex_str.trim(), 16).map_err(|e| {
+                                ConnectionError::MalformedResponse(format!(
+                                    "잘못된 16진수 크기: {}",
+                                    e
+                                ))
+                            })?;
+
+                        if decimal_size == 0 {
+                            state = ChunkParseState::DataEndCr;
+                        } else {
+                            state = ChunkParseState::ReadingData;
+                        }
+                    } else {
+                        return Err(ConnectionError::MalformedResponse("LF 누락".to_string()));
+                    }
+                }
+
+                ChunkParseState::ReadingData => {
+                    data_bytes.push(b);
+                    if data_bytes.len() == decimal_size {
+                        state = ChunkParseState::DataEndCr;
+                    }
+                }
+
+                ChunkParseState::DataEndCr => {
+                    if b == b'\r' {
+                        state = ChunkParseState::DataEndLf;
+                    } else {
+                        return Err(ConnectionError::MalformedResponse(
+                            "데이터 뒤 CR 누락".to_string(),
+                        ));
+                    }
+                }
+
+                ChunkParseState::DataEndLf => {
+                    if b == b'\n' {
+                        let raw_chunk = &stream_buffer[..parse_idx];
+
+                        client_stream.write_all(raw_chunk).await?;
+
+                        if decimal_size == 0 {
+                            return Ok(());
+                        }
+
+                        size_bytes.clear();
+                        data_bytes.clear();
+                        state = ChunkParseState::ReadingSize;
+
+                        stream_buffer.drain(0..parse_idx);
+                        parse_idx = 0;
+                    } else {
+                        return Err(ConnectionError::MalformedResponse(
+                            "데이터 뒤 LF 누락".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let n = backend_stream.read(&mut read_buf).await.map_err(|e| {
+            selection.backend.note_traffic_result(false);
+            eprintln!("백엔드 응답 body read 실패: {}", e);
+            ConnectionError::Io(e)
+        })?;
+
+        if n == 0 {
+            selection.backend.note_traffic_result(false);
+            return Err(ConnectionError::BackendClosedMidResponse);
+        }
+
+        stream_buffer.extend_from_slice(&read_buf[..n]);
+    }
+}
+
+fn detect_body_kind(headers: &[(String, Vec<u8>)]) -> Result<BodyKind, ConnectionError> {
+    let mut transfer_encoding: Option<&[u8]> = None;
+    let mut content_length: Option<&[u8]> = None;
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            transfer_encoding = Some(value);
+        } else if name.eq_ignore_ascii_case("Content-Length") {
+            content_length = Some(value);
+        }
+    }
+
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err(ConnectionError::MalformedResponse(
+            "Content-Length 와 Transfer-Encoding 는 동시에 허용하지 않음".into(),
+        ));
+    }
+
+    if let Some(value) = transfer_encoding {
+        let value = std::str::from_utf8(value).map_err(|_| {
+            ConnectionError::MalformedResponse("유효하지 않은 Transfer-Encoding 헤더".into())
+        })?;
+
+        let last_encoding = value.split(',').map(str::trim).last().ok_or_else(|| {
+            ConnectionError::MalformedResponse("유효하지 않은 Transfer-Encoding".into())
+        })?;
+
+        if !last_encoding.eq_ignore_ascii_case("chunked") {
+            return Err(ConnectionError::MalformedResponse(format!(
+                "지원되지 않는 Transfer-Encoding: {value}"
+            )));
+        }
+
+        return Ok(BodyKind::Chunked);
+    }
+
+    if let Some(value) = content_length {
+        let value = std::str::from_utf8(value).map_err(|_| {
+            ConnectionError::MalformedResponse("유효하지 않은 Content-Length 헤더".into())
+        })?;
+
+        let length = value.parse::<usize>().map_err(|_| {
+            ConnectionError::MalformedResponse(format!("유효하지 않은 Content-Length 값: {value}"))
+        })?;
+
+        return Ok(BodyKind::ContentLength(length));
+    }
+
+    Ok(BodyKind::None)
 }
