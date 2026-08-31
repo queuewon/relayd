@@ -13,6 +13,8 @@ pub const ALL_BACKENDS_UNAVAILABLE: &[u8] =
     b"HTTP/1.1 502 All Backends Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 pub const SERVICE_UNAVAILABLE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub const GATEWAY_TIMEOUT: &[u8] =
+    b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: Close\r\n\r\n";
 
 pub async fn parse_backend_header(
     backend_stream: &mut TcpStream,
