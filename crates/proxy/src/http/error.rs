@@ -1,6 +1,12 @@
 use std::{io, num::ParseIntError, str::Utf8Error};
 
 #[derive(Debug)]
+pub enum TimeoutKind {
+    ResponseHeader, // 요청 전송 후 응답 헤더가 온전할 때까지
+    Overall,        // 요청에서 응답까지
+}
+
+#[derive(Debug)]
 pub enum PoolError {
     AcquireTimeout, // 풀에서 permit을 timeout 안에 못 얻음ㄴ
 }
@@ -17,6 +23,8 @@ pub enum ConnectionError {
     MalformedResponse(String),
     BackendClosedBeforeResponse, // 응답 헤더 받기 전 백엔드 연결이 끊어짐.
     BackendClosedMidResponse,    // 헤더, 바디 일부를 클라이언트에 write 후 백엔드가 연결이 끊어짐.
+
+    BackendTimeout(TimeoutKind), // 백엔드로부터 제때 응답을 받지 못해 시간이 초과됨.
 }
 impl From<io::Error> for ConnectionError {
     fn from(e: io::Error) -> Self {
