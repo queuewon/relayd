@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::{
-    backend::HealthPolicy,
+    backend::{Admitted, HealthPolicy},
     balancer::{Backend, BalancerError, DecrementGuard, Selection},
+    circuit_breaker::CircuitBreaker,
 };
 
 pub struct LeastConnectionsBackend {
@@ -18,9 +19,9 @@ pub struct LeastConnectionsBackend {
 }
 
 impl LeastConnectionsBackend {
-    pub fn new(addr: SocketAddr, health_policy: HealthPolicy) -> Self {
+    pub fn new(addr: SocketAddr, health_policy: HealthPolicy, circuit: CircuitBreaker) -> Self {
         Self {
-            base: Backend::new(addr, health_policy),
+            base: Backend::new(addr, health_policy, circuit),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -43,35 +44,57 @@ impl LeastConnectionsBalancer {
             return Err(BalancerError::NoBackendAvailable);
         }
 
-        let available_backends: Vec<&LeastConnectionsBackend> = self
-            .backends
-            .iter()
-            .filter(|b| !failed_backends.contains(&b.base.addr))
-            .filter(|b| b.base.is_routable())
-            .collect();
+        for _ in 0..self.backend_count() {
+            let available_backends: Vec<&LeastConnectionsBackend> = self
+                .backends
+                .iter()
+                .filter(|b| !failed_backends.contains(&b.base.addr))
+                .filter(|b| b.base.is_routable())
+                .collect();
 
-        if available_backends.is_empty() {
-            return Err(BalancerError::NoBackendAvailable);
+            if available_backends.is_empty() {
+                return Err(BalancerError::NoBackendAvailable);
+            }
+
+            let found_min_count_item = available_backends
+                .iter()
+                .min_by_key(|b| b.active_connections.load(Ordering::Relaxed));
+
+            let backend = match found_min_count_item {
+                Some(backend) => backend,
+                None => {
+                    unreachable!()
+                }
+            };
+            let admitted = backend.base.try_admit();
+
+            match admitted {
+                Admitted::Closed => {
+                    backend.active_connections.fetch_add(1, Ordering::Relaxed);
+                    let guard = DecrementGuard {
+                        counter: backend.active_connections.clone(),
+                    };
+
+                    return Ok(Selection::new(backend.base.clone(), Some(guard), None));
+                }
+                Admitted::Probe(half_open_guard) => {
+                    backend.active_connections.fetch_add(1, Ordering::Relaxed);
+                    let guard = DecrementGuard {
+                        counter: backend.active_connections.clone(),
+                    };
+                    return Ok(Selection::new(
+                        backend.base.clone(),
+                        Some(guard),
+                        Some(half_open_guard),
+                    ));
+                }
+                Admitted::Rejected => {
+                    continue;
+                }
+            }
         }
 
-        let found_min_count_item = available_backends
-            .iter()
-            .min_by_key(|b| b.active_connections.load(Ordering::Relaxed));
-
-        let backend = match found_min_count_item {
-            Some(backend) => backend,
-            None => {
-                unreachable!()
-            }
-        };
-
-        backend.active_connections.fetch_add(1, Ordering::Relaxed);
-
-        let guard = DecrementGuard {
-            counter: backend.active_connections.clone(),
-        };
-
-        Ok(Selection::with_guard(backend.base.clone(), guard))
+        Err(BalancerError::NoBackendAvailable)
     }
 
     pub fn backend_count(&self) -> usize {

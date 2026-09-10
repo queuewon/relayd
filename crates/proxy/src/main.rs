@@ -6,6 +6,7 @@ use crate::{balancer::Balancer, config::ProxyConfig, pool::connection_pool::Conn
 
 pub mod backend;
 pub mod balancer;
+pub mod circuit_breaker;
 pub mod config;
 pub mod connection;
 pub mod health_check;
@@ -18,9 +19,9 @@ async fn main() -> io::Result<()> {
         .nth(1)
         .expect("config 파일 설정 경로를 인자로 지정하는 작업이 필요");
     let content = std::fs::read_to_string(path).expect("프록시 설정파일 불러오기 실패");
-    let config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
+    let proxy_config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
 
-    let balancer = Balancer::from_config(config);
+    let balancer = Balancer::from_config(proxy_config);
 
     health_check::start_health_checks(&balancer);
 

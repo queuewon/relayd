@@ -9,13 +9,14 @@ use std::{
 };
 
 use crate::{
-    backend::{Backend, HealthPolicy, Threshold},
+    backend::{Backend, HalfOpenGuard, HealthPolicy, Threshold},
     balancer::{
         least_connections::{LeastConnectionsBackend, LeastConnectionsBalancer},
         round_robin::RoundRobinBalancer,
         weight_round_robin::{WeightRoundRobinBackend, WeightRoundRobinBalancer},
     },
-    config::{self, ParsedBackendConfig, ProxyConfig},
+    circuit_breaker::{CircuitBreaker, CircuitState},
+    config::{self, CircuitConfig, ParsedBackendConfig, ProxyConfig},
 };
 
 pub mod least_connections;
@@ -25,7 +26,6 @@ pub mod weight_round_robin;
 struct DecrementGuard {
     counter: Arc<AtomicUsize>,
 }
-
 impl Drop for DecrementGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
@@ -35,23 +35,20 @@ impl Drop for DecrementGuard {
 // 밸런서 별 백엔드 구조체에 DecrementGuard를 추가하려 했으나, 백엔드 서버가 실제로 죽어야만 drop 되므로 Selection
 pub struct Selection {
     pub backend: Backend,
-    _guard: Option<DecrementGuard>,
+    _decrement_guard: Option<DecrementGuard>,
+    _halfopen_guard: Option<HalfOpenGuard>,
 }
 
 impl Selection {
-    // RR/WRR처럼 감소시킬 게 없는 경우
-    fn without_guard(backend: Backend) -> Self {
+    fn new(
+        backend: Backend,
+        decrement_guard: Option<DecrementGuard>,
+        halfopen_guard: Option<HalfOpenGuard>,
+    ) -> Self {
         Self {
             backend,
-            _guard: None,
-        }
-    }
-
-    // LeastConnections처럼 감소가 필요한 경우
-    fn with_guard(backend: Backend, guard: DecrementGuard) -> Self {
-        Self {
-            backend,
-            _guard: Some(guard),
+            _decrement_guard: decrement_guard,
+            _halfopen_guard: halfopen_guard,
         }
     }
 }
@@ -121,31 +118,41 @@ impl Balancer {
                 health: 3,
                 unhealth: 3,
             },
-            traffic: Threshold {
-                health: 2,
-                unhealth: 5,
-            },
+        };
+
+        let circuit = CircuitBreaker {
+            streak: 0,
+            state: CircuitState::Closed,
+            backoff_count: 0,
+            config: CircuitConfig::default(),
         };
 
         let balancer = match cfg.algorithm {
             config::Algorithm::RoundRobin => {
                 let backends: Vec<Backend> = backend_configs
                     .iter()
-                    .map(|b| Backend::new(b.addr, health_policy))
+                    .map(|b| Backend::new(b.addr, health_policy, circuit.clone()))
                     .collect();
                 Balancer::RoundRobin(RoundRobinBalancer::new(backends))
             }
             config::Algorithm::Weighted => {
                 let backends: Vec<WeightRoundRobinBackend> = backend_configs
                     .iter()
-                    .map(|b| WeightRoundRobinBackend::new(b.addr, b.weight, health_policy))
+                    .map(|b| {
+                        WeightRoundRobinBackend::new(
+                            b.addr,
+                            b.weight,
+                            health_policy,
+                            circuit.clone(),
+                        )
+                    })
                     .collect();
                 Balancer::Weighted(WeightRoundRobinBalancer::new(backends))
             }
             config::Algorithm::LeastConnections => {
                 let backends: Vec<LeastConnectionsBackend> = backend_configs
                     .iter()
-                    .map(|b| LeastConnectionsBackend::new(b.addr, health_policy))
+                    .map(|b| LeastConnectionsBackend::new(b.addr, health_policy, circuit.clone()))
                     .collect();
                 Balancer::LeastConnections(LeastConnectionsBalancer::new(backends))
             }

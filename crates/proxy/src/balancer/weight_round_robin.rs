@@ -1,8 +1,9 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Mutex};
 
 use crate::{
-    backend::HealthPolicy,
+    backend::{Admitted, HealthPolicy},
     balancer::{Backend, BalancerError, Selection},
+    circuit_breaker::CircuitBreaker,
 };
 
 pub struct WeightRoundRobinBackend {
@@ -11,9 +12,14 @@ pub struct WeightRoundRobinBackend {
     weight: u8,
 }
 impl WeightRoundRobinBackend {
-    pub fn new(addr: SocketAddr, weight: u8, health_policy: HealthPolicy) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        weight: u8,
+        health_policy: HealthPolicy,
+        circuit: CircuitBreaker,
+    ) -> Self {
         Self {
-            base: Backend::new(addr, health_policy),
+            base: Backend::new(addr, health_policy, circuit),
             current_weight: 0,
             weight,
         }
@@ -41,40 +47,61 @@ impl WeightRoundRobinBalancer {
             return Err(BalancerError::NoBackendAvailable);
         }
 
-        let mut available_backends: Vec<&mut WeightRoundRobinBackend> = guard
-            .iter_mut()
-            .filter(|b| !failed_backends.contains(&b.base.addr))
-            .filter(|b| b.base.is_routable())
+        // is_routable / failed_backends 통과한 후보의 '인덱스'만 모음 (참조 대신 인덱스 -> borrow 회피)
+        let available_indices: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !failed_backends.contains(&b.base.addr))
+            .filter(|(_, b)| b.base.is_routable())
+            .map(|(i, _)| i)
             .collect();
-        if available_backends.is_empty() {
+        if available_indices.is_empty() {
             return Err(BalancerError::NoBackendAvailable);
         }
 
+        // 후보 전체 current_weight 증가 (1회) + total_weight 계산
         let mut total_weight: i32 = 0;
-
-        for backend in available_backends.iter_mut() {
-            let weight = backend.weight as i32;
-            backend.current_weight += weight;
-
-            total_weight += backend.weight as i32;
+        for &i in &available_indices {
+            let w = guard[i].weight as i32;
+            guard[i].current_weight += w;
+            total_weight += w;
         }
 
-        let found_max_current_weight_item = available_backends
-            .iter_mut()
-            .max_by_key(|backend| backend.current_weight);
+        // Rejected로 제외된 인덱스 추적
+        let mut rejected: HashSet<usize> = HashSet::new();
 
-        let max_current_weight_item = match found_max_current_weight_item {
-            Some(backend) => backend,
-            None => {
-                unreachable!()
+        loop {
+            // 아직 제외 안 된 후보 중 current_weight 최대 인덱스
+            let found_max = available_indices
+                .iter()
+                .filter(|i| !rejected.contains(i))
+                .max_by_key(|&&i| guard[i].current_weight)
+                .copied();
+
+            let max_idx = match found_max {
+                Some(i) => i,
+                None => return Err(BalancerError::NoBackendAvailable), // 후보 다 소진
+            };
+
+            match guard[max_idx].base.try_admit() {
+                Admitted::Closed => {
+                    guard[max_idx].current_weight -= total_weight;
+                    return Ok(Selection::new(guard[max_idx].base.clone(), None, None));
+                }
+                Admitted::Probe(half_open_guard) => {
+                    guard[max_idx].current_weight -= total_weight;
+                    return Ok(Selection::new(
+                        guard[max_idx].base.clone(),
+                        None,
+                        Some(half_open_guard),
+                    ));
+                }
+                Admitted::Rejected => {
+                    rejected.insert(max_idx);
+                    continue;
+                }
             }
-        };
-
-        max_current_weight_item.current_weight -= total_weight as i32;
-
-        Ok(Selection::without_guard(
-            max_current_weight_item.base.clone(),
-        ))
+        }
     }
 
     pub fn backend_count(&self) -> usize {
