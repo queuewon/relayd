@@ -1,16 +1,15 @@
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, get, web};
+use clap::Parser;
 use serde::Deserialize;
 use std::{
-    env,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
-struct Config {
-    name: String,
-    delay_ms: usize,
-    fail_requests: AtomicBool,
-}
+use crate::{cli_args::CliArgs, config::Config};
+
+pub mod cli_args;
+pub mod config;
 
 #[derive(Deserialize)]
 struct SlowBodyReqQuery {
@@ -83,19 +82,15 @@ async fn slow_body(cfg: web::Data<Config>, query: web::Query<SlowBodyReqQuery>) 
 }
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-
-    let name = args.get(1).cloned().unwrap_or_else(|| "A".into());
-    let port: u16 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(8081);
-    let delay_ms = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let args = CliArgs::parse();
 
     let config = Config {
-        name,
-        delay_ms,
+        name: args.name,
+        delay_ms: args.delay_ms,
         fail_requests: AtomicBool::new(false),
     };
 
-    println!("backend {} listening on {}", config.name, port);
+    println!("backend {} listening on {}", config.name, args.port);
 
     let data = web::Data::new(config);
 
@@ -110,7 +105,7 @@ async fn main() -> std::io::Result<()> {
             .service(slow_body)
             .service(error)
     })
-    .bind(("127.0.0.1", port))?
+    .bind(("127.0.0.1", args.port))?
     .run()
     .await
 }
