@@ -10,7 +10,7 @@ pub struct HealthProbe {
 }
 
 // 현재는 reqwest 사용
-pub async fn health_check_loop(health_probe: HealthProbe) {
+pub async fn health_check_loop(health_probe: HealthProbe, interval: Duration) {
     loop {
         let url = format!("http://{}/healthz", health_probe.backend.addr);
         let health = health_probe.client.get(&url).send().await;
@@ -25,8 +25,8 @@ pub async fn health_check_loop(health_probe: HealthProbe) {
                     health_probe.backend.addr.to_string()
                 );
 
-                let sleep = Duration::from_secs(1);
-                tokio::time::sleep(sleep).await;
+                // interval 두고 재시도
+                tokio::time::sleep(interval).await;
 
                 continue;
             }
@@ -41,15 +41,14 @@ pub async fn health_check_loop(health_probe: HealthProbe) {
             }
         }
 
-        let sleep = Duration::from_secs(1);
-        tokio::time::sleep(sleep).await;
+        tokio::time::sleep(interval).await;
     }
 }
 
 // 성공 시: counter가 0 이하였으면 1로 설정, 0보다 컸으면 +1. 그 후 healthy가 false이고 counter가 M 이상이면 healthy를 true로.
 // 실패 시: counter가 0보다 컸으면 -1로 설정, 0 이하였으면 -1. 그 후 healthy가 true이고 counter가 -N 이하이면 healthy를 false로.
 
-pub fn start_health_checks(balancer: &Balancer) {
+pub fn start_health_checks(balancer: &Balancer, interval: Duration) {
     let backends = balancer.all_backends();
 
     for backend in backends.into_iter() {
@@ -59,7 +58,7 @@ pub fn start_health_checks(balancer: &Balancer) {
 
             let health_probe = HealthProbe { client, backend };
 
-            health_check_loop(health_probe).await;
+            health_check_loop(health_probe, interval).await;
         });
     }
 }

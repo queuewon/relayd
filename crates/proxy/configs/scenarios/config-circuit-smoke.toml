@@ -1,0 +1,15 @@
+algorithm = "round_robin"
+
+[[backends]]
+addr = "127.0.0.1:8081"
+
+[health]
+interval_milli_secs = 1000
+health_threshold = 3
+unhealth_threshold = 3
+
+[circuit]
+failure_threshold = 3
+initial_open_secs = 10
+backoff_multiplier = 2
+max_open_secs = 60

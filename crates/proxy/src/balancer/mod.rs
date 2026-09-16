@@ -16,7 +16,7 @@ use crate::{
         weight_round_robin::{WeightRoundRobinBackend, WeightRoundRobinBalancer},
     },
     circuit_breaker::{CircuitBreaker, CircuitState},
-    config::{self, CircuitConfig, ParsedBackendConfig, ProxyConfig},
+    config::{self, ParsedBackendConfig, ProxyConfig},
 };
 
 pub mod least_connections;
@@ -115,8 +115,8 @@ impl Balancer {
 
         let health_policy = HealthPolicy {
             probe: Threshold {
-                health: 3,
-                unhealth: 3,
+                health: cfg.health.health_threshold as isize,
+                unhealth: cfg.health.unhealth_threshold as isize,
             },
         };
 
@@ -124,7 +124,7 @@ impl Balancer {
             streak: 0,
             state: CircuitState::Closed,
             backoff_count: 0,
-            config: CircuitConfig::default(),
+            config: cfg.circuit,
         };
 
         let balancer = match cfg.algorithm {

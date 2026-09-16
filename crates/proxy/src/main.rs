@@ -21,9 +21,11 @@ async fn main() -> io::Result<()> {
     let content = std::fs::read_to_string(path).expect("프록시 설정파일 불러오기 실패");
     let proxy_config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
 
+    let health_check_interval = Duration::from_millis(proxy_config.health.interval_milli_secs);
+
     let balancer = Balancer::from_config(proxy_config);
 
-    health_check::start_health_checks(&balancer);
+    health_check::start_health_checks(&balancer, health_check_interval);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
@@ -32,8 +34,8 @@ async fn main() -> io::Result<()> {
     let conn_pool = Arc::new(ConnectionPool::new(20));
 
     let max_idle = Duration::new(5, 0);
-    let interval = Duration::new(10, 0);
-    conn_pool.spawn_cleanup_task(max_idle, interval);
+    let cleanup_interval = Duration::new(10, 0);
+    conn_pool.spawn_cleanup_task(max_idle, cleanup_interval);
 
     loop {
         // 여러 .await를 동시에 감시하다가 먼저 끝나는 쪽을 처리하는 도구

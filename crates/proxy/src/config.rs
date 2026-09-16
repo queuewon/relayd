@@ -18,15 +18,22 @@ pub struct ParsedBackendConfig {
     pub addr: SocketAddr,
     pub weight: u8,
 }
-
-#[derive(Deserialize)]
-pub struct ProxyConfig {
-    pub algorithm: Algorithm,
-    pub backends: Vec<BackendConfig>,
-    #[serde(default)]
-    pub circuit: CircuitConfig,
+#[derive(Deserialize, Debug)]
+pub struct HealthConfig {
+    pub interval_milli_secs: u64,
+    pub health_threshold: isize,
+    pub unhealth_threshold: isize,
 }
-
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            interval_milli_secs: 1000,
+            health_threshold: 3,
+            unhealth_threshold: 3,
+        }
+    }
+}
+// TODO: config 가져오기
 #[derive(Deserialize, Clone, Copy)]
 pub struct CircuitConfig {
     pub failure_threshold: isize, // 임계값
@@ -43,4 +50,13 @@ impl Default for CircuitConfig {
             max_open_secs: 60,
         }
     }
+}
+#[derive(Deserialize)]
+pub struct ProxyConfig {
+    pub algorithm: Algorithm,
+    pub backends: Vec<BackendConfig>,
+    #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
+    pub circuit: CircuitConfig,
 }
