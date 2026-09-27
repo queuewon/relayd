@@ -33,8 +33,8 @@ impl Default for HealthConfig {
         }
     }
 }
-// TODO: config 가져오기
-#[derive(Deserialize, Clone, Copy)]
+
+#[derive(Deserialize, Clone, Copy, Debug)]
 pub struct CircuitConfig {
     pub failure_threshold: isize, // 임계값
     pub initial_open_secs: u64,   // 첫 Open 시간(첫 차단 시간)
@@ -51,7 +51,7 @@ impl Default for CircuitConfig {
         }
     }
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct ProxyConfig {
     pub algorithm: Algorithm,
     pub backends: Vec<BackendConfig>,

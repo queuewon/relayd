@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::CircuitConfig;
 
@@ -60,9 +60,12 @@ impl CircuitBreaker {
                     let until = self.open_until();
                     self.state = CircuitState::Open { until };
                     self.backoff_count += 1;
+
+                    let epoch_ms = Self::now_epoch_ms();
+
                     println!(
-                        "[circuit] Closed→Open | streak={} backoff={} until={:?}",
-                        self.streak, self.backoff_count, until
+                        "[circuit] Closed→Open | streak={} backoff={} until={:?} epoch_ms={}",
+                        self.streak, self.backoff_count, until, epoch_ms
                     );
                 }
             }
@@ -73,15 +76,23 @@ impl CircuitBreaker {
                 if success {
                     self.state = CircuitState::Closed;
                     self.backoff_count = 0;
-                    println!("[circuit] HalfOpen→Closed | 시험 성공");
+
+                    let epoch_ms = Self::now_epoch_ms();
+
+                    println!(
+                        "[circuit] HalfOpen→Closed | 시험 성공 epoch_ms={}",
+                        epoch_ms
+                    );
                 } else {
                     let until = self.open_until();
                     self.backoff_count += 1;
                     self.state = CircuitState::Open { until };
 
+                    let epoch_ms = Self::now_epoch_ms();
+
                     println!(
-                        "[circuit] HalfOpen→Open | 시험 실패 backoff={} until={:?}",
-                        self.backoff_count, until
+                        "[circuit] HalfOpen→Open | 시험 실패 backoff={} until={:?} epoch_ms={}",
+                        self.backoff_count, until, epoch_ms
                     );
                 }
             }
@@ -121,7 +132,13 @@ impl CircuitBreaker {
                 // 차단 시간이 끝남 - 회복 여부를 볼 첫 시험 요청을 이 요청으로 보냄
                 if now >= until {
                     self.state = CircuitState::HalfOpen { probing: true };
-                    println!("[circuit] Open→HalfOpen | 시험 요청 시작");
+
+                    let epoch_ms = Self::now_epoch_ms();
+
+                    println!(
+                        "[circuit] Open→HalfOpen | 시험 요청 시작 epoch_ms={} ",
+                        epoch_ms
+                    );
                     return CircuitDecision::Probe;
                 }
                 CircuitDecision::Rejected
@@ -136,6 +153,13 @@ impl CircuitBreaker {
                 CircuitDecision::Rejected
             }
         }
+    }
+
+    pub fn now_epoch_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_millis()
     }
 }
 #[cfg(test)]

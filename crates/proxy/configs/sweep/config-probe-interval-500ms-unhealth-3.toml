@@ -3,13 +3,19 @@ algorithm = "round_robin"
 [[backends]]
 addr = "127.0.0.1:8081"
 
+[[backends]]
+addr = "127.0.0.1:8082"
+
+[[backends]]
+addr = "127.0.0.1:8083"
+
 [health]
-interval_milli_secs = 1000
+interval_milli_secs = 500
 health_threshold = 3
 unhealth_threshold = 3
 
 [circuit]
-failure_threshold = 3
+failure_threshold = 5
 initial_open_secs = 10
 backoff_multiplier = 2
 max_open_secs = 60

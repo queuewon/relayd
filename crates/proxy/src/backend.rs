@@ -125,9 +125,10 @@ impl Backend {
         };
 
         if !matches!(result, StreakTransition::NoChange) {
+            let ms = CircuitBreaker::now_epoch_ms();
             println!(
-                "probe 헬스 체크 | 백엔드 {} {:#?}로 상태변환",
-                self.addr, result
+                "probe 헬스 체크 | 백엔드 {} {:#?}로 상태변환, epoch_ms={}",
+                self.addr, result, ms
             );
         }
     }

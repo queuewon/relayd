@@ -18,12 +18,12 @@ pub async fn health_check_loop(health_probe: HealthProbe, interval: Duration) {
         let resp = match health {
             Ok(r) => r,
             Err(e) => {
-                health_probe.backend.note_probe_result(false);
-
                 println!(
                     "{} 주소 헬스체크 오류 | {e:#?}",
                     health_probe.backend.addr.to_string()
                 );
+
+                health_probe.backend.note_probe_result(false);
 
                 // interval 두고 재시도
                 tokio::time::sleep(interval).await;

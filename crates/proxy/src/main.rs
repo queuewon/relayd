@@ -21,6 +21,8 @@ async fn main() -> io::Result<()> {
     let content = std::fs::read_to_string(path).expect("프록시 설정파일 불러오기 실패");
     let proxy_config: ProxyConfig = toml::from_str(&content).expect("프록시 설정파일 적용 실패");
 
+    println!("\n프록시 설정파일 적용 성공: {:#?}\n", proxy_config);
+
     let health_check_interval = Duration::from_millis(proxy_config.health.interval_milli_secs);
 
     let balancer = Balancer::from_config(proxy_config);
