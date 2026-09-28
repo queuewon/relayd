@@ -37,6 +37,12 @@ async fn main() -> io::Result<()> {
 
     let max_idle = Duration::new(5, 0);
     let cleanup_interval = Duration::new(10, 0);
+
+    println!(
+        "[init] 프록시 서버 시작: max_idle={:?}, cleanup_interval={:?}",
+        max_idle, cleanup_interval
+    );
+
     conn_pool.spawn_cleanup_task(max_idle, cleanup_interval);
 
     loop {
@@ -46,7 +52,7 @@ async fn main() -> io::Result<()> {
                 let (client_stream, client_addr) = match accept_result {
                     Ok((stream, addr)) => (stream, addr),
                     Err(e) => {
-                        eprintln!("클라이언트 연결 수락 실패: {}", e);
+                        eprintln!("[error] 클라이언트 연결 수락 실패: {}", e);
                         continue;
                     }
                 };
@@ -63,12 +69,12 @@ async fn main() -> io::Result<()> {
                     )
                     .await
                     {
-                        eprintln!("연결 처리 중 에러: {:?}", e);
+                        eprintln!("[error] 연결 처리 중 에러: {:?}", e);
                     }
                 });
             }
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("종료 신호 수신, 커넥션 풀 재사용률: {:.2}%", conn_pool.reuse_rate());
+                eprintln!("[shutdown] 종료 신호 수신, 커넥션 풀 재사용률: {:.2}%", conn_pool.reuse_rate());
                 break;
             }
         }

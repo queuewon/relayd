@@ -12,6 +12,7 @@ use tokio::{
 
 use crate::{
     balancer::{Balancer, BalancerError, Selection},
+    circuit_breaker::CircuitBreaker,
     http::{
         error::{
             BodyKind,
@@ -237,11 +238,21 @@ pub async fn connect_with_retry(
                 }
             },
         };
-        println!("백엔드 {} 선택", selection.backend.addr);
+
+        println!("[info] 백엔드 {} 선택", selection.backend.addr);
 
         let found_conn = conn_pool.take(selection.backend.addr).await;
+
         match found_conn {
             Some(mut conn) => {
+                println!(
+                    "[info] 백엔드 {} 커넥션 재사용, 프록시 포트 {}, idle_ms={}, epoch_ms={}",
+                    selection.backend.addr,
+                    conn.proxy_port(),
+                    conn.idle_ms(),
+                    CircuitBreaker::now_epoch_ms(),
+                );
+
                 conn.reused = true;
                 return Ok((conn, selection));
             }
@@ -256,7 +267,7 @@ pub async fn connect_with_retry(
                         selection.backend.note_traffic_result(false);
                         failed_backends.insert(selection.backend.addr);
                         eprintln!(
-                            "타임아웃 | 백엔드 {} 연결 실패: {}",
+                            "[timeout] | 백엔드 {} 연결 실패: {}",
                             selection.backend.addr, e
                         );
                         continue;
@@ -267,7 +278,10 @@ pub async fn connect_with_retry(
                     Err(e) => {
                         selection.backend.note_traffic_result(false);
                         failed_backends.insert(selection.backend.addr);
-                        eprintln!("백엔드 {} 연결 실패: {}", selection.backend.addr, e);
+                        eprintln!(
+                            "[error] | 백엔드 {} 연결 실패: {}",
+                            selection.backend.addr, e
+                        );
                         continue;
                     }
                 };
@@ -280,19 +294,24 @@ pub async fn connect_with_retry(
                         // 프록시 측 자원 고갈 문제이기에 수동 헬스체크 미수행
                         failed_backends.insert(selection.backend.addr);
                         eprintln!(
-                            "백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
+                            "[error] | 백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
                             selection.backend.addr
                         );
                         continue;
                     }
                 };
 
-                // handle_connection에서 백엔드로 데이터를 보내고 나서야 비로소 올바른 헬스체크라 판단하여 해당 메소드에서는 success 수동 헬스체크 미수행
+                let pooled_conn = PooledConnection::new(stream, permit, selection.backend.addr);
 
-                return Ok((
-                    PooledConnection::new(stream, permit, selection.backend.addr),
-                    selection,
-                ));
+                println!(
+                    "[info] 백엔드 {} 연결 성공, permit 획득 성공, 프록시 포트 {},epoch_ms={}",
+                    selection.backend.addr,
+                    pooled_conn.proxy_port(),
+                    CircuitBreaker::now_epoch_ms(),
+                );
+
+                // handle_connection에서 백엔드로 데이터를 보내고 나서야 비로소 올바른 헬스체크라 판단하여 해당 메소드에서는 success 수동 헬스체크 미수행
+                return Ok((pooled_conn, selection));
             }
         }
     }

@@ -13,7 +13,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 
-use crate::http::error::PoolError;
+use crate::{circuit_breaker::CircuitBreaker, http::error::PoolError};
 
 pub struct PooledConnection {
     pub stream: TcpStream,
@@ -41,6 +41,21 @@ impl PooledConnection {
             returned_at: Instant::now(),
             reused: false,
         }
+    }
+
+    pub fn idle_ms(&self) -> u128 {
+        self.returned_at.elapsed().as_millis()
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.backend_addr
+    }
+
+    pub fn proxy_port(&self) -> u16 {
+        self.stream
+            .local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(0)
     }
 }
 
@@ -132,10 +147,41 @@ impl ConnectionPool {
         let lock = self.pool.try_lock();
 
         if let Ok(mut guard) = lock {
-            for conns in guard.values_mut() {
+            let before_list = guard
+                .values()
+                .flatten()
+                .map(|conn| (conn.addr(), conn.proxy_port(), conn.idle_ms()))
+                .collect::<Vec<_>>();
+            println!(
+                "[cleanup] 유휴 커넥션 정리 시작: 전체 제거 전 개수 {}, (백엔드 주소, 프록시 쪽 임시 포트, idle_ms) 목록 {:?}, epoch_ms={}",
+                before_list.len(),
+                before_list,
+                CircuitBreaker::now_epoch_ms()
+            );
+
+            for (backend_addr, conns) in guard.iter_mut() {
                 conns.retain(|conn| conn.returned_at.elapsed() < max_idle);
+
+                let remaining = conns
+                    .iter()
+                    .map(|conn| (conn.proxy_port(), conn.idle_ms()))
+                    .collect::<Vec<_>>();
+                println!(
+                    "[cleanup] 유휴 커넥션 정리 완료: 백엔드 {} 제거 후 개수 {}, (프록시 쪽 임시 포트, idle_ms) 목록 {:?}, epoch_ms={}",
+                    backend_addr,
+                    conns.len(),
+                    remaining,
+                    CircuitBreaker::now_epoch_ms()
+                );
             }
+
+            return;
         }
+
+        println!(
+            "[cleanup] 유휴 커넥션 정리 시도 중 lock 획득 실패, 건너뜀, epoch_ms={}",
+            CircuitBreaker::now_epoch_ms()
+        );
     }
 
     // 백그라운드 유휴 커넥션 정리
@@ -144,6 +190,7 @@ impl ConnectionPool {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+
                 pool.cleanup_idle(max_idle).await;
             }
         });
