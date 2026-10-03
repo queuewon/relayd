@@ -14,6 +14,7 @@ pub enum PoolError {
 #[derive(Debug)]
 pub enum ConnectionError {
     Io(io::Error),            // read 자체가 실패한 경우, 소켓이 죽음
+    Timeout,                  // 백엔드 연결 Timtout
     ClientClosed,             // 파싱 완료 전 EOF
     MalformedRequest(String), // 파싱 실패 — 400 대상
     AllBackendsUnreachable,   // 연결 실패 - 모든 백엔드 순회 후 실패
@@ -25,6 +26,8 @@ pub enum ConnectionError {
     BackendClosedMidResponse,    // 헤더, 바디 일부를 클라이언트에 write 후 백엔드가 연결이 끊어짐.
 
     BackendTimeout(TimeoutKind), // 백엔드로부터 제때 응답을 받지 못해 시간이 초과됨.
+
+    ReusedConnectionClosed, // 재사용 커넥션이 응답 첫 바이트 전에 끊김
 }
 impl From<io::Error> for ConnectionError {
     fn from(e: io::Error) -> Self {

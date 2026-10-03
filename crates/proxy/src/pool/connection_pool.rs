@@ -77,15 +77,18 @@ pub struct ConnectionPool {
 
     reuse_count: AtomicUsize, // take가 Some 반환 횟수
     new_count: AtomicUsize,   // take가 None 반환 횟수
+
+    max_idle: Duration, // 유휴 커넥션 제거 기준 시간
 }
 
 impl ConnectionPool {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new(max_size: usize, max_idle: Duration) -> Self {
         Self {
             pool: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max_size)),
             reuse_count: AtomicUsize::new(0),
             new_count: AtomicUsize::new(0),
+            max_idle,
         }
     }
 
@@ -93,17 +96,45 @@ impl ConnectionPool {
     // 1. semaphore 필드는 TcpStream 인스턴스 총량을 세는 필드임.
     // 2. permit은 "TcpStream 인스턴스가 메모리상 존재하냐 안 하냐"를 확인하는 용도 이므로 take()에서는 풀에 있던 것을 활용하는 것이기 때문에 permit의 값에 변경을 줄 필요가 없음. 왜냐하면 살아있되 쉬고 있던걸 일을 다시 시키는 것이기 때문
     pub async fn take(&self, addr: SocketAddr) -> Option<PooledConnection> {
-        // TODO: Mutex poison 발생 시 복구 전략 미정. 현재는 lock 구간에 .await/panic 가능 로직을 두지 않는 설계로
-        let mut guard = self.pool.lock().unwrap();
-        let found_conn = guard.get_mut(&addr).and_then(|p| p.pop());
+        let found_conn = {
+            // TODO: Mutex poison 발생 시 복구 전략 미정. 현재는 lock 구간에 .await/panic 가능 로직을 두지 않는 설계로
+            let mut guard = self.pool.lock().unwrap();
+            let found_conn = guard.get_mut(&addr).and_then(|p| p.pop());
 
-        if found_conn.is_some() {
-            self.reuse_count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.new_count.fetch_add(1, Ordering::Relaxed);
-        }
+            found_conn
+        };
 
-        found_conn
+        let conn = match found_conn {
+            Some(mut conn) => {
+                // 유휴시간이 max_idle을 초과한 커넥션은 폐기하고 None 반환
+                if conn.returned_at.elapsed() >= self.max_idle() {
+                    self.new_count.fetch_add(1, Ordering::Relaxed);
+                    println!(
+                        "[info] 백엔드 {} 커넥션 재사용 시도 중 유휴시간 초과로 폐기, 프록시 포트 {}, idle_ms={}, epoch_ms={}",
+                        addr,
+                        conn.proxy_port(),
+                        conn.idle_ms(),
+                        CircuitBreaker::now_epoch_ms()
+                    );
+                    return None;
+                } else {
+                    self.reuse_count.fetch_add(1, Ordering::Relaxed);
+                }
+                conn.reused = true;
+                conn
+            }
+            None => {
+                self.new_count.fetch_add(1, Ordering::Relaxed);
+                println!(
+                    "[info] 백엔드 {} 커넥션 재사용 시도 중 풀에 없음, epoch_ms={}",
+                    addr,
+                    CircuitBreaker::now_epoch_ms()
+                );
+                return None;
+            }
+        };
+
+        Some(conn)
     }
 
     // 풀에 커넥션 반납
@@ -185,11 +216,13 @@ impl ConnectionPool {
     }
 
     // 백그라운드 유휴 커넥션 정리
-    pub fn spawn_cleanup_task(self: &Arc<Self>, max_idle: Duration, interval: Duration) {
+    pub fn spawn_cleanup_task(self: &Arc<Self>, interval: Duration) {
         let pool = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+
+                let max_idle = pool.max_idle();
 
                 pool.cleanup_idle(max_idle).await;
             }
@@ -206,5 +239,10 @@ impl ConnectionPool {
         } else {
             reuse / total * 100.0
         }
+    }
+
+    // max_idle 값 조회
+    pub fn max_idle(&self) -> Duration {
+        self.max_idle
     }
 }

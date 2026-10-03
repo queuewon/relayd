@@ -160,41 +160,49 @@ pub async fn handle_connection(
     };
 
     // 7. 클라이언트 <-> 백엔드 간 데이터 스트리밍
-    let future = send_and_relay_response(
+    let relay_result = relay_with_timeout(
         &mut client_stream,
-        &mut backend_conn.stream,
-        &ser_req_buf,
+        &mut backend_conn,
         &selection,
-    );
-
-    let relay_duration = Duration::from_secs(30);
-    let relay_timeout_result = tokio::time::timeout(relay_duration, future).await;
-    let relay_result = match relay_timeout_result {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!(
-                "타임아웃 | 백엔드 {}, 백엔드 요청 ~ 클라이언트 응답 작업 실패, 경과시간: {}",
-                selection.backend.addr, e
-            );
-
-            // 실패 기록은 원칙적으로 send_and_relay_response 내부에서 하지만,
-            // 타임아웃은 future가 취소되어 내부 코드가 실행될 수 없으므로 여기서 기록함
-
-            selection.backend.note_traffic_result(false);
-
-            let _ = client_stream.shutdown().await;
-            return Err(ConnectionError::BackendTimeout(TimeoutKind::Overall));
-        }
-    };
+        &ser_req_buf,
+    )
+    .await;
 
     // 이 구간 이후 즉, Overall 타임아웃은 항상 응답 바디 전송 중에 발동한다고 전제하고 504 대체 응답 없이 연결만 끊기. (헤더 타임아웃 < 전체 타임아웃 관계에 의존)
     // send_and_relay_response()에선 헤더 타임아웃(5s)이 먼저 자르는 구간이 존재하기 때문에, 30s를 소모할 수 있는 구간은 바디 스트리밍뿐
     // 그 시점엔 이미 클라이언트에 200 상태를 write한 뒤라(헤더 라인을 이미 써버림.) 504로 정정할 방법이 없음(HTTP/1.1은 응답당 상태 라인이 하나).
     let parsed_res = match relay_result {
         Ok(res) => res,
+        Err(ConnectionError::ReusedConnectionClosed) => {
+            println!(
+                "[info] 백엔드 {} 재사용 커넥션 끊김, 재시도 시도, epoch_ms={}",
+                selection.backend.addr,
+                CircuitBreaker::now_epoch_ms()
+            );
+
+            let new_conn_result = connect_new(&selection, conn_pool).await;
+            let pooled_conn = match new_conn_result {
+                Ok(conn) => conn,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+
+            backend_conn = pooled_conn;
+
+            let relay_result = relay_with_timeout(
+                &mut client_stream,
+                &mut backend_conn,
+                &selection,
+                &ser_req_buf,
+            )
+            .await;
+
+            relay_result?
+        }
+
         Err(e) => {
             eprintln!("백엔드 {} 릴레이 실패: {:#?}", selection.backend.addr, e);
-
             // 클라이언트 스트림 write 실패는 백엔드 책임이 아니므로 traffic 기록 없이 반환
             return Err(e);
         }
@@ -244,7 +252,7 @@ pub async fn connect_with_retry(
         let found_conn = conn_pool.take(selection.backend.addr).await;
 
         match found_conn {
-            Some(mut conn) => {
+            Some(conn) => {
                 println!(
                     "[info] 백엔드 {} 커넥션 재사용, 프록시 포트 {}, idle_ms={}, epoch_ms={}",
                     selection.backend.addr,
@@ -253,62 +261,17 @@ pub async fn connect_with_retry(
                     CircuitBreaker::now_epoch_ms(),
                 );
 
-                conn.reused = true;
                 return Ok((conn, selection));
             }
             None => {
-                let connect_timeout = Duration::from_secs(1);
-                let future = TcpStream::connect(selection.backend.addr);
-                let timeout_result = tokio::time::timeout(connect_timeout, future).await;
-
-                let connect_result = match timeout_result {
-                    Ok(t) => t,
-                    Err(e) => {
-                        selection.backend.note_traffic_result(false);
+                let new_conn_result = connect_new(&selection, conn_pool).await;
+                let pooled_conn = match new_conn_result {
+                    Ok(conn) => conn,
+                    Err(_) => {
                         failed_backends.insert(selection.backend.addr);
-                        eprintln!(
-                            "[timeout] | 백엔드 {} 연결 실패: {}",
-                            selection.backend.addr, e
-                        );
                         continue;
                     }
                 };
-                let stream = match connect_result {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        selection.backend.note_traffic_result(false);
-                        failed_backends.insert(selection.backend.addr);
-                        eprintln!(
-                            "[error] | 백엔드 {} 연결 실패: {}",
-                            selection.backend.addr, e
-                        );
-                        continue;
-                    }
-                };
-
-                let permit_timeout = Duration::new(5, 0);
-
-                let permit = match conn_pool.acquire_permit(permit_timeout).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // 프록시 측 자원 고갈 문제이기에 수동 헬스체크 미수행
-                        failed_backends.insert(selection.backend.addr);
-                        eprintln!(
-                            "[error] | 백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
-                            selection.backend.addr
-                        );
-                        continue;
-                    }
-                };
-
-                let pooled_conn = PooledConnection::new(stream, permit, selection.backend.addr);
-
-                println!(
-                    "[info] 백엔드 {} 연결 성공, permit 획득 성공, 프록시 포트 {},epoch_ms={}",
-                    selection.backend.addr,
-                    pooled_conn.proxy_port(),
-                    CircuitBreaker::now_epoch_ms(),
-                );
 
                 // handle_connection에서 백엔드로 데이터를 보내고 나서야 비로소 올바른 헬스체크라 판단하여 해당 메소드에서는 success 수동 헬스체크 미수행
                 return Ok((pooled_conn, selection));
@@ -324,9 +287,13 @@ async fn send_and_relay_response(
     backend_stream: &mut TcpStream,
     req_bytes: &[u8],
     selection: &Selection,
+    reused: bool,
 ) -> Result<ResponseHeaderParseResult, ConnectionError> {
     // 1. 클라이언트 -> 백엔드 데이터 전송
     if let Err(e) = backend_stream.write_all(req_bytes).await {
+        if reused {
+            return Err(ConnectionError::ReusedConnectionClosed);
+        }
         selection.backend.note_traffic_result(false);
         eprintln!("클라이언트 -> 백엔드 데이터 전송 실패: {}", e);
         return Err(ConnectionError::Io(e));
@@ -361,6 +328,14 @@ async fn send_and_relay_response(
     let parsed_res = match parsed_backend_header_result {
         Ok(res) => res,
         Err(e) => {
+            if reused
+                && (matches!(e, ConnectionError::BackendClosedBeforeResponse)
+                    | matches!(e, ConnectionError::Io(_)))
+                && backend_buf.is_empty()
+            {
+                return Err(ConnectionError::ReusedConnectionClosed);
+            }
+
             eprintln!("백엔드 헤더 파싱 실패: {:#?}", e);
             selection.backend.note_traffic_result(false);
             return Err(e);
@@ -554,6 +529,100 @@ pub async fn relay_chunked_body(
 
         stream_buffer.extend_from_slice(&read_buf[..n]);
     }
+}
+
+async fn connect_new(
+    selection: &Selection,
+    conn_pool: &Arc<ConnectionPool>,
+) -> Result<PooledConnection, ConnectionError> {
+    let connect_timeout = Duration::from_secs(1);
+    let future = TcpStream::connect(selection.backend.addr);
+    let timeout_result = tokio::time::timeout(connect_timeout, future).await;
+
+    let connect_result = match timeout_result {
+        Ok(t) => t,
+        Err(e) => {
+            selection.backend.note_traffic_result(false);
+
+            eprintln!(
+                "[timeout] | 백엔드 {} 연결 실패: {}",
+                selection.backend.addr, e
+            );
+            return Err(ConnectionError::Timeout);
+        }
+    };
+    let stream = match connect_result {
+        Ok(stream) => stream,
+        Err(e) => {
+            selection.backend.note_traffic_result(false);
+            eprintln!(
+                "[error] | 백엔드 {} 연결 실패: {}",
+                selection.backend.addr, e
+            );
+            return Err(ConnectionError::Io(e));
+        }
+    };
+
+    let permit_timeout = Duration::new(5, 0);
+
+    let permit = match conn_pool.acquire_permit(permit_timeout).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "[error] | 백엔드 {:#?}에 연결은 성공했으나 permit 획득 실패, 연결 폐기: {e:#?}",
+                selection.backend.addr
+            );
+            return Err(ConnectionError::PoolAcquireTimeout);
+        }
+    };
+
+    let pooled_conn = PooledConnection::new(stream, permit, selection.backend.addr);
+
+    println!(
+        "[info] 백엔드 {} 연결 성공, permit 획득 성공, 프록시 포트 {},epoch_ms={}",
+        selection.backend.addr,
+        pooled_conn.proxy_port(),
+        CircuitBreaker::now_epoch_ms(),
+    );
+
+    Ok(pooled_conn)
+}
+
+async fn relay_with_timeout(
+    client_stream: &mut TcpStream,
+    backend_conn: &mut PooledConnection,
+    selection: &Selection,
+    ser_req_buf: &[u8],
+) -> Result<ResponseHeaderParseResult, ConnectionError> {
+    let future = send_and_relay_response(
+        client_stream,
+        &mut backend_conn.stream,
+        &ser_req_buf,
+        &selection,
+        backend_conn.reused,
+    );
+
+    let relay_duration = Duration::from_secs(30);
+    let relay_timeout_result = tokio::time::timeout(relay_duration, future).await;
+    let relay_result = match relay_timeout_result {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!(
+                "타임아웃 | 백엔드 {}, 백엔드 요청 ~ 클라이언트 응답 작업 실패, 경과시간: {}",
+                selection.backend.addr, e
+            );
+
+            // 실패 기록은 원칙적으로 send_and_relay_response 내부에서 하지만,
+            // 타임아웃은 future가 취소되어 내부 코드가 실행될 수 없으므로 여기서 기록함
+
+            selection.backend.note_traffic_result(false);
+
+            let _ = client_stream.shutdown().await;
+            return Err(ConnectionError::BackendTimeout(TimeoutKind::Overall));
+        }
+    };
+
+    relay_result
 }
 
 fn detect_body_kind(headers: &[(String, Vec<u8>)]) -> Result<BodyKind, ConnectionError> {
