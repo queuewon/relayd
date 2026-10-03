@@ -56,6 +56,8 @@ pub async fn handle_connection(
         body: Vec::new(),
     };
 
+    let mut failed_backends: HashSet<SocketAddr> = HashSet::new();
+
     // 1. 클라이언트 요청 헤더 파싱
     if let Err(e) =
         request::parse_client_header(&mut client_stream, &mut parsed_req, &mut client_buf).await
@@ -85,28 +87,29 @@ pub async fn handle_connection(
     };
 
     // 2. 백엔드 연결
-    let (mut backend_conn, selection) = match connect_with_retry(balancer, conn_pool).await {
-        Ok(conn) => conn,
-        Err(ConnectionError::AllBackendsUnreachable) => {
-            eprintln!("백엔드 연결 실패");
-            let res = response::ALL_BACKENDS_UNAVAILABLE;
-            if let Err(write_err) = client_stream.write_all(res).await {
-                eprintln!("502 응답 작성 실패: {}", write_err);
+    let (mut backend_conn, mut selection) =
+        match connect_with_retry(balancer, conn_pool, &mut failed_backends).await {
+            Ok(conn) => conn,
+            Err(ConnectionError::AllBackendsUnreachable) => {
+                eprintln!("백엔드 연결 실패");
+                let res = response::ALL_BACKENDS_UNAVAILABLE;
+                if let Err(write_err) = client_stream.write_all(res).await {
+                    eprintln!("502 응답 작성 실패: {}", write_err);
+                }
+                let _ = client_stream.shutdown().await;
+                return Err(ConnectionError::AllBackendsUnreachable);
             }
-            let _ = client_stream.shutdown().await;
-            return Err(ConnectionError::AllBackendsUnreachable);
-        }
-        Err(ConnectionError::NoBackendAvailable) => {
-            eprintln!("가용 백엔드 없음");
-            let res = response::SERVICE_UNAVAILABLE;
-            if let Err(write_err) = client_stream.write_all(res).await {
-                eprintln!("503 응답 작성 실패: {}", write_err);
+            Err(ConnectionError::NoBackendAvailable) => {
+                eprintln!("가용 백엔드 없음");
+                let res = response::SERVICE_UNAVAILABLE;
+                if let Err(write_err) = client_stream.write_all(res).await {
+                    eprintln!("503 응답 작성 실패: {}", write_err);
+                }
+                let _ = client_stream.shutdown().await;
+                return Err(ConnectionError::NoBackendAvailable);
             }
-            let _ = client_stream.shutdown().await;
-            return Err(ConnectionError::NoBackendAvailable);
-        }
-        Err(e) => return Err(e), // connect_with_retry가 다른 variant는 반환 안 하지만 방어적으로
-    };
+            Err(e) => return Err(e), // connect_with_retry가 다른 variant는 반환 안 하지만 방어적으로
+        };
 
     // 3. 파싱된 클라이언트 헤더에 X-Forwarded-For 헤더 추가
     let xff_name = "X-Forwarded-For".to_string();
@@ -171,6 +174,7 @@ pub async fn handle_connection(
     // 이 구간 이후 즉, Overall 타임아웃은 항상 응답 바디 전송 중에 발동한다고 전제하고 504 대체 응답 없이 연결만 끊기. (헤더 타임아웃 < 전체 타임아웃 관계에 의존)
     // send_and_relay_response()에선 헤더 타임아웃(5s)이 먼저 자르는 구간이 존재하기 때문에, 30s를 소모할 수 있는 구간은 바디 스트리밍뿐
     // 그 시점엔 이미 클라이언트에 200 상태를 write한 뒤라(헤더 라인을 이미 써버림.) 504로 정정할 방법이 없음(HTTP/1.1은 응답당 상태 라인이 하나).
+
     let parsed_res = match relay_result {
         Ok(res) => res,
         Err(ConnectionError::ReusedConnectionClosed) => {
@@ -183,8 +187,34 @@ pub async fn handle_connection(
             let new_conn_result = connect_new(&selection, conn_pool).await;
             let pooled_conn = match new_conn_result {
                 Ok(conn) => conn,
-                Err(e) => {
-                    return Err(e);
+                Err(_) => {
+                    failed_backends.insert(selection.backend.addr);
+
+                    match connect_with_retry(balancer, conn_pool, &mut failed_backends).await {
+                        Ok((conn, new_selection)) => {
+                            selection = new_selection;
+                            conn
+                        }
+                        Err(ConnectionError::AllBackendsUnreachable) => {
+                            eprintln!("백엔드 연결 실패");
+                            let res = response::ALL_BACKENDS_UNAVAILABLE;
+                            if let Err(write_err) = client_stream.write_all(res).await {
+                                eprintln!("502 응답 작성 실패: {}", write_err);
+                            }
+                            let _ = client_stream.shutdown().await;
+                            return Err(ConnectionError::AllBackendsUnreachable);
+                        }
+                        Err(ConnectionError::NoBackendAvailable) => {
+                            eprintln!("가용 백엔드 없음");
+                            let res = response::SERVICE_UNAVAILABLE;
+                            if let Err(write_err) = client_stream.write_all(res).await {
+                                eprintln!("503 응답 작성 실패: {}", write_err);
+                            }
+                            let _ = client_stream.shutdown().await;
+                            return Err(ConnectionError::NoBackendAvailable);
+                        }
+                        Err(e) => return Err(e), // connect_with_retry가 다른 variant는 반환 안 하지만 방어적으로
+                    }
                 }
             };
 
@@ -229,15 +259,14 @@ pub async fn handle_connection(
 pub async fn connect_with_retry(
     balancer: &Arc<Balancer>,
     conn_pool: &Arc<ConnectionPool>,
+    failed_backends: &mut HashSet<SocketAddr>,
 ) -> Result<(PooledConnection, Selection), ConnectionError> {
     if balancer.backend_count() == 0 {
         return Err(ConnectionError::NoBackendAvailable);
     }
 
-    let mut failed_backends: HashSet<SocketAddr> = HashSet::new();
-
     for _ in 0..balancer.backend_count() {
-        let found_next_backend = balancer.next_backend(&failed_backends);
+        let found_next_backend = balancer.next_backend(failed_backends);
         let selection = match found_next_backend {
             Ok(addr) => addr,
             Err(e) => match e {
